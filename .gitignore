@@ -1,1 +1,31 @@
+# Top-level env/config
 .env
+
+# macOS
+.DS_Store
+
+# Node/Expo frontend artifacts
+client/node_modules
+client/.expo
+client/.expo-shared
+client/dist
+client/.expo-env.d.ts
+client/.env
+
+# Logs and coverage
+**/*.log
+client/coverage
+
+# TypeScript build info
+client/tsconfig.tsbuildinfo
+
+# Python backend artifacts
+server/venv
+server/.env
+server/__pycache__
+server/.pytest_cache
+server/.ruff_cache
+
+# IDE/editor
+.idea
+.vscode
