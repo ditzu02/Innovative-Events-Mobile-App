@@ -48,3 +48,9 @@ This wireframe outlines the page where users submit reviews for hosts or locatio
 
 **Saved / Account (`wireframe_saved_account.png`)**  
 The account screen shows basic profile information and lists events the user has saved. It also contains account actions such as sign out and settings management. This screen lays the groundwork for a future user profile and permissions management flow.
+
+## Backend setup (current)
+- Set DB env vars in `server/.env`: `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`.
+- Create tables in your Postgres DB: `psql \"$DB_NAME\" -f server/schema.sql` (ensure the role has privileges to create the `pgcrypto` extension).
+- Run the Flask API: `cd server && python main.py`. Health check: `GET /health`. Events endpoint (DB-backed): `GET /api/events`.
+- Seed sample data: `cd server && python seed_db.py` (uses the same `.env` DB credentials). Seeds locations, events, tags, and event_tags.
