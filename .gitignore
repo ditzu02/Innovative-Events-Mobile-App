@@ -25,6 +25,8 @@ server/.env
 server/__pycache__
 server/.pytest_cache
 server/.ruff_cache
+**/*.pyc
+**/__pycache__/
 
 # IDE/editor
 .idea

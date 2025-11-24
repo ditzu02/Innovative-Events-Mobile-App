@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Image, ScrollView, StyleSheet, Text, View } from "react-native";
-import { Stack, useLocalSearchParams } from "expo-router";
+import {
+  ActivityIndicator,
+  Image,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+  Pressable,
+} from "react-native";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { request } from "@/lib/api";
 
 type EventDetail = {
@@ -38,6 +46,7 @@ type EventDetail = {
 
 export default function EventDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  const router = useRouter();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -60,7 +69,17 @@ export default function EventDetailScreen() {
 
   return (
     <>
-      <Stack.Screen options={{ title: event?.title ?? "Event" }} />
+      <Stack.Screen
+        options={{
+          title: event?.title ?? "Event",
+          headerBackTitle: "Back",
+          headerLeft: () => (
+            <Pressable onPress={() => router.back()} style={{ paddingHorizontal: 8 }}>
+              <Text style={{ color: "#3949ab", fontWeight: "600" }}>Back</Text>
+            </Pressable>
+          ),
+        }}
+      />
       <ScrollView contentContainerStyle={styles.container}>
         {loading && (
           <View style={styles.center}>
@@ -74,13 +93,25 @@ export default function EventDetailScreen() {
         {!loading && !error && event && (
           <View style={styles.content}>
             {event.cover_image_url ? (
-              <Image source={{ uri: event.cover_image_url }} style={styles.hero} resizeMode="cover" />
-            ) : null}
-
-            <Text style={styles.title}>{event.title}</Text>
-            <Text style={styles.subtitle}>
-              {event.category ?? "Uncategorized"} · {event.start_time} - {event.end_time}
-            </Text>
+              <View style={styles.heroWrap}>
+                <Image source={{ uri: event.cover_image_url }} style={styles.hero} resizeMode="cover" />
+                <View style={styles.heroOverlay} />
+                <View style={styles.heroText}>
+                  <Text style={styles.heroTitle}>{event.title}</Text>
+                  <Text style={styles.heroMeta}>
+                    {event.category ?? "Uncategorized"} · {formatTimeRange(event.start_time, event.end_time)}
+                  </Text>
+                  {event.location?.name ? <Text style={styles.heroMeta}>{event.location.name}</Text> : null}
+                </View>
+              </View>
+            ) : (
+              <>
+                <Text style={styles.title}>{event.title}</Text>
+                <Text style={styles.subtitle}>
+                  {event.category ?? "Uncategorized"} · {formatTimeRange(event.start_time, event.end_time)}
+                </Text>
+              </>
+            )}
 
             {event.tags && event.tags.length > 0 && (
               <View style={styles.row}>
@@ -92,25 +123,42 @@ export default function EventDetailScreen() {
               </View>
             )}
 
-            {event.location && (
-              <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Location</Text>
-                <Text style={styles.body}>{event.location.name ?? "Unknown location"}</Text>
-                <Text style={styles.muted}>{event.location.address}</Text>
-              </View>
-            )}
+            <View style={styles.actionRow}>
+              <Pressable style={styles.primaryButton}>
+                <Text style={styles.primaryButtonText}>Buy Tickets</Text>
+              </Pressable>
+              <Pressable style={styles.secondaryButton}>
+                <Text style={styles.secondaryButtonText}>Save</Text>
+              </Pressable>
+            </View>
 
-            {event.price != null || event.rating_avg != null ? (
-              <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Highlights</Text>
-                {event.price != null && <Text style={styles.body}>Price: €{event.price.toFixed(2)}</Text>}
+            {(event.location || event.price != null || event.rating_avg != null) && (
+              <View style={styles.infoCard}>
+                {event.location && (
+                  <View style={styles.infoRow}>
+                    <Text style={styles.infoLabel}>Location</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.infoValue}>{event.location.name ?? "Unknown location"}</Text>
+                      {event.location.address ? <Text style={styles.muted}>{event.location.address}</Text> : null}
+                    </View>
+                  </View>
+                )}
+                {event.price != null && (
+                  <View style={styles.infoRow}>
+                    <Text style={styles.infoLabel}>Price</Text>
+                    <Text style={styles.infoValue}>€{event.price.toFixed(2)}</Text>
+                  </View>
+                )}
                 {event.rating_avg != null && (
-                  <Text style={styles.body}>
-                    Rating: {event.rating_avg.toFixed(1)} ({event.rating_count ?? 0})
-                  </Text>
+                  <View style={styles.infoRow}>
+                    <Text style={styles.infoLabel}>Rating</Text>
+                    <Text style={styles.infoValue}>
+                      {event.rating_avg.toFixed(1)} ({event.rating_count ?? 0})
+                    </Text>
+                  </View>
                 )}
               </View>
-            ) : null}
+            )}
 
             {event.description && (
               <View style={styles.section}>
@@ -169,22 +217,70 @@ function formatTag(tag: string) {
   return tag.charAt(0).toUpperCase() + tag.slice(1);
 }
 
+function formatTimeRange(start: string | null, end: string | null) {
+  if (!start || !end) return "Time TBA";
+  try {
+    const s = new Date(start);
+    const e = new Date(end);
+    const dateFmt: Intl.DateTimeFormatOptions = { weekday: "short", month: "short", day: "numeric" };
+    const timeFmt: Intl.DateTimeFormatOptions = { hour: "numeric", minute: "2-digit" };
+    return `${s.toLocaleDateString(undefined, dateFmt)} · ${s.toLocaleTimeString(undefined, timeFmt)} - ${e.toLocaleTimeString(undefined, timeFmt)}`;
+  } catch {
+    return `${start} - ${end}`;
+  }
+}
+
 const styles = StyleSheet.create({
-  container: { padding: 16 },
+  container: { padding: 16, backgroundColor: "#f7f8fb" },
   center: { alignItems: "center", justifyContent: "center", gap: 8, paddingVertical: 40 },
   content: { gap: 16 },
   title: { fontSize: 22, fontWeight: "700" },
   subtitle: { fontSize: 14, color: "#555" },
   message: { fontSize: 14 },
   error: { color: "red", fontSize: 14 },
-  hero: { width: "100%", height: 220, borderRadius: 12 },
+  heroWrap: { borderRadius: 16, overflow: "hidden", position: "relative" },
+  hero: { width: "100%", height: 260 },
+  heroOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.25)" },
+  heroText: { position: "absolute", left: 16, bottom: 16, right: 16, gap: 4 },
+  heroTitle: { fontSize: 22, fontWeight: "800", color: "#fff" },
+  heroMeta: { color: "#f0f0f0" },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   badge: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, backgroundColor: "#eef2ff" },
   badgeText: { fontSize: 12, color: "#3949ab" },
+  actionRow: { flexDirection: "row", gap: 10 },
+  primaryButton: {
+    flex: 1,
+    backgroundColor: "#3949ab",
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  primaryButtonText: { color: "#fff", fontWeight: "700", fontSize: 14 },
+  secondaryButton: {
+    width: 90,
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#3949ab",
+    backgroundColor: "#eef2ff",
+  },
+  secondaryButtonText: { color: "#3949ab", fontWeight: "700", fontSize: 14 },
   section: { gap: 8 },
   sectionTitle: { fontSize: 16, fontWeight: "600" },
   body: { fontSize: 14, color: "#222" },
   muted: { fontSize: 12, color: "#666" },
+  infoCard: {
+    backgroundColor: "#fff",
+    borderRadius: 14,
+    padding: 12,
+    gap: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#e5e5e5",
+  },
+  infoRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  infoLabel: { fontSize: 13, color: "#666", width: 90 },
+  infoValue: { fontSize: 14, color: "#222", flex: 1, textAlign: "right" },
   card: {
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: "#ddd",

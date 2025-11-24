@@ -1,12 +1,15 @@
 from datetime import datetime
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from dotenv import load_dotenv
-from psycopg2.pool import SimpleConnectionPool
-from decimal import Decimal
 import logging
 import os
 from pathlib import Path
+from decimal import Decimal
+
+import psycopg2
+from psycopg2 import OperationalError, InterfaceError
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from dotenv import load_dotenv
+from psycopg2.pool import SimpleConnectionPool, PoolError
 
 app = Flask(__name__)
 CORS(app)
@@ -25,6 +28,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
+DB_SSLMODE = os.getenv("DB_SSLMODE", "require")
 
 REQUIRED_ENV_VARS = {
     "DB_USER": DB_USER,
@@ -45,20 +49,28 @@ logger.info("Loaded database configuration for host=%s port=%s db=%s", DB_HOST, 
 db_pool: SimpleConnectionPool | None = None
 
 
-def init_db_pool() -> None:
+def init_db_pool(force: bool = False) -> None:
     """Initialize a global connection pool."""
     global db_pool
-    if db_pool:
+    if db_pool and not force:
         return
+    if db_pool and force:
+        try:
+            db_pool.closeall()
+        except Exception:
+            logger.exception("Error closing existing connection pool")
+        db_pool = None
     try:
         db_pool = SimpleConnectionPool(
             minconn=1,
-            maxconn=5,
+            maxconn=3,
             user=DB_USER,
             password=DB_PASSWORD,
             host=DB_HOST,
             port=DB_PORT,
             dbname=DB_NAME,
+            sslmode=DB_SSLMODE,
+            connect_timeout=5,
         )
         logger.info("Database connection pool initialized")
     except Exception:
@@ -70,13 +82,62 @@ def get_db_connection():
     """Get a connection from the pool."""
     if not db_pool:
         init_db_pool()
-    return db_pool.getconn()
+    try:
+        return db_pool.getconn()
+    except PoolError:
+        logger.warning("Pool exhausted; resetting pool")
+        reset_db_pool()
+        return db_pool.getconn()
 
 
 def release_db_connection(connection) -> None:
     """Return a connection to the pool."""
     if db_pool and connection:
-        db_pool.putconn(connection)
+        try:
+            db_pool.putconn(connection)
+        except PoolError:
+            logger.warning("Attempted to return a connection not tracked by the pool; closing it instead")
+            try:
+                connection.close()
+            except Exception:
+                logger.exception("Failed to close stray connection")
+
+
+def reset_db_pool():
+    """Force-close and recreate the connection pool."""
+    init_db_pool(force=True)
+
+
+def execute_with_retry(query: str, params: tuple = ()) -> tuple:
+    """
+    Execute a query with a retry if the connection drops.
+    Returns (connection, cursor) so the caller can fetch and release.
+    """
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(query, params)
+        return connection, cursor
+    except (psycopg2.OperationalError, PoolError):
+        logger.exception("DB connection lost, retrying once with fresh pool")
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        release_db_connection(connection)
+        reset_db_pool()
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(query, params)
+        return connection, cursor
+    except Exception:
+        # Ensure we don't leak resources on unexpected errors
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        release_db_connection(connection)
+        raise
 
 
 # Initialize pool on startup to fail fast if DB is unreachable
@@ -192,6 +253,11 @@ def list_events():
             filters.append("%s = ANY(COALESCE(ta.tags, '{}'))")
             params.append(tag)
 
+        city = request.args.get("city")
+        if city:
+            filters.append("COALESCE(l.address, '') ILIKE %s")
+            params.append(f"%{city}%")
+
         date_str = request.args.get("date")
         if date_str:
             try:
@@ -221,8 +287,25 @@ def list_events():
         else:
             query += " ORDER BY e.start_time ASC"
 
-        cursor.execute(query, tuple(params))
-        rows = cursor.fetchall()
+        try:
+            connection = get_db_connection()
+            cursor = connection.cursor()
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
+        except (OperationalError, InterfaceError, PoolError):
+            logger.exception("DB error while fetching events, retrying once with fresh pool")
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection:
+                release_db_connection(connection)
+            reset_db_pool()
+            connection = get_db_connection()
+            cursor = connection.cursor()
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
 
         events = []
         for row in rows:
@@ -279,16 +362,24 @@ def list_events():
                     "rating_count": review_count if review_count is not None else rating_count,
                     "tags": tags or [],
                     "location": location,
+                    "latitude": float(location_latitude) if location_latitude is not None else None,
+                    "longitude": float(location_longitude) if location_longitude is not None else None,
                 }
             )
 
         return jsonify({"events": events})
+    except PoolError:
+        logger.exception("Connection pool unavailable while fetching events")
+        return jsonify({"error": "Database unavailable, please retry"}), 503
     except Exception:
         logger.exception("Failed to fetch events")
         return jsonify({"error": "Unable to fetch events"}), 500
     finally:
         if cursor:
-            cursor.close()
+            try:
+                cursor.close()
+            except Exception:
+                logger.exception("Failed to close cursor")
         if connection:
             release_db_connection(connection)
 
