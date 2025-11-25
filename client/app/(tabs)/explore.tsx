@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, FlatList, TextInput, Dimensions, Modal } from "react-native";
+import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, FlatList, TextInput, Dimensions, Modal, Platform } from "react-native";
 import MapView, { Marker, PROVIDER_GOOGLE, Region, Callout } from "react-native-maps";
 import Slider from "@react-native-community/slider";
+import DateTimePicker from "@react-native-community/datetimepicker";
 import { useRouter } from "expo-router";
 import { request } from "@/lib/api";
 
@@ -35,6 +36,10 @@ export default function DiscoverScreen() {
   const [sort, setSort] = useState<"date" | "toprated" | "price">("date");
   const [error, setError] = useState<string | null>(null);
   const [filtersExpanded, setFiltersExpanded] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<Date | null>(null);
+  const [selectedTime, setSelectedTime] = useState<Date | null>(null);
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
   const router = useRouter();
   const [mapExpanded, setMapExpanded] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null);
@@ -87,6 +92,8 @@ export default function DiscoverScreen() {
         if (selectedCategory) searchParams.append("category", selectedCategory);
         if (selectedCity) searchParams.append("city", selectedCity);
         if (sort) searchParams.append("sort", sort === "date" ? "soonest" : sort);
+        if (selectedDate) searchParams.append("date", selectedDate.toISOString().split("T")[0]);
+        if (selectedTime) searchParams.append("time", formatTime(selectedTime));
         if (minRating != null) searchParams.append("min_rating", String(minRating));
         const qs = searchParams.toString();
         const data = await request<{ events: Event[] }>(qs ? `/api/events?${qs}` : "/api/events", { timeoutMs: 20000 });
@@ -100,7 +107,7 @@ export default function DiscoverScreen() {
         setLoading(false);
       }
     },
-    [selectedTag, selectedCategory, selectedCity, sort, minRating]
+    [selectedTag, selectedCategory, selectedCity, selectedDate, selectedTime, sort, minRating]
   );
 
   useEffect(() => {
@@ -132,6 +139,58 @@ export default function DiscoverScreen() {
 
         {filtersExpanded && (
           <View style={{ gap: 12 }}>
+            <View style={{ gap: 6 }}>
+              <Text style={styles.chipLabel}>Date</Text>
+              <View style={styles.row}>
+                <Pressable style={styles.badge} onPress={() => setShowDatePicker((prev) => !prev)}>
+                  <Text style={styles.badgeText}>{selectedDate ? selectedDate.toLocaleDateString() : "Pick date"}</Text>
+                </Pressable>
+                {selectedDate && (
+                  <Pressable style={styles.badge} onPress={() => setSelectedDate(null)}>
+                    <Text style={styles.badgeText}>Clear</Text>
+                  </Pressable>
+                )}
+              </View>
+              {showDatePicker && (
+                <View style={styles.pickerWrap}>
+                  <DateTimePicker
+                    value={selectedDate ?? new Date()}
+                    mode="date"
+                    display={Platform.OS === "ios" ? "inline" : "calendar"}
+                    themeVariant="light"
+                    textColor="#000"
+                    onChange={(_, date) => { setShowDatePicker(false); if (date) setSelectedDate(date); }}
+                  />
+                </View>
+              )}
+            </View>
+
+            <View style={{ gap: 6 }}>
+              <Text style={styles.chipLabel}>Time</Text>
+              <View style={styles.row}>
+                <Pressable style={styles.badge} onPress={() => setShowTimePicker((prev) => !prev)}>
+                  <Text style={styles.badgeText}>{selectedTime ? formatTime(selectedTime) : "Pick time"}</Text>
+                </Pressable>
+                {selectedTime && (
+                  <Pressable style={styles.badge} onPress={() => setSelectedTime(null)}>
+                    <Text style={styles.badgeText}>Clear</Text>
+                  </Pressable>
+                )}
+              </View>
+              {showTimePicker && (
+                <View style={styles.pickerWrap}>
+                  <DateTimePicker
+                    value={selectedTime ?? new Date()}
+                    mode="time"
+                    display="spinner"
+                    themeVariant="light"
+                    textColor="#000"
+                    onChange={(_, date) => { setShowTimePicker(false); if (date) setSelectedTime(date); }}
+                  />
+                </View>
+              )}
+            </View>
+
             <FilterChips
               label="Tags"
               options={TAG_OPTIONS}
@@ -168,6 +227,8 @@ export default function DiscoverScreen() {
               setSelectedCategory(null);
               setSelectedCity(null);
               setCityQuery("");
+              setSelectedDate(null);
+              setSelectedTime(null);
               setMinRating(null);
               setSort("date");
             }}>
@@ -343,6 +404,14 @@ function labelToSort(label: string | null): "date" | "toprated" | "price" {
   if (l === "top rated") return "toprated";
   if (l === "price") return "price";
   return "date";
+}
+
+function formatTime(d: Date) {
+  try {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  } catch {
+    return "";
+  }
 }
 
 function initialRegion(city: string | null): Region {
@@ -561,6 +630,11 @@ const styles = StyleSheet.create({
   overlayHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   overlayTitle: { fontSize: 16, fontWeight: "700" },
   overlayClose: { color: "#3949ab", fontWeight: "600" },
+  pickerWrap: {
+    backgroundColor: "#fff",
+    borderRadius: 12,
+    overflow: "hidden",
+  },
   sheet: {
     position: "absolute",
     bottom: 0,

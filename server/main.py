@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, time
 import logging
 import os
 from pathlib import Path
@@ -266,6 +266,15 @@ def list_events():
                 params.append(parsed)
             except ValueError:
                 return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+        target_time_param = request.args.get("time")
+        if target_time_param:
+            try:
+                target_t = datetime.strptime(target_time_param, "%H:%M").time()
+                filters.append("CAST(e.start_time AS time) <= %s AND CAST(e.end_time AS time) >= %s")
+                params.extend([target_t, target_t])
+            except ValueError:
+                return jsonify({"error": "Invalid time. Use HH:MM (24h)."}), 400
 
         min_rating = request.args.get("min_rating")
         if min_rating:
