@@ -39,12 +39,36 @@ export default function DiscoverScreen() {
   const [mapExpanded, setMapExpanded] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null);
   const [pendingNavId, setPendingNavId] = useState<string | null>(null);
-
+  const [showListOverlay, setShowListOverlay] = useState(false);
+  const [mapRegion, setMapRegion] = useState<Region>(() => initialRegion(null));
+  const visibleEvents = useMemo(() => {
+    if (!mapRegion || !events) return events ?? [];
+    const { latitude, longitude, latitudeDelta, longitudeDelta } = mapRegion;
+    const minLat = latitude - latitudeDelta / 2;
+    const maxLat = latitude + latitudeDelta / 2;
+    const minLng = longitude - longitudeDelta / 2;
+    const maxLng = longitude + longitudeDelta / 2;
+    return (events ?? []).filter(
+      (e) =>
+        e.latitude != null &&
+        e.longitude != null &&
+        e.latitude >= minLat &&
+        e.latitude <= maxLat &&
+        e.longitude >= minLng &&
+        e.longitude <= maxLng
+    );
+  }, [mapRegion, events]);
   const handleOpenEvent = (id: string) => {
     setSelectedEvent(null);
     setPendingNavId(id);
     setMapExpanded(false);
   };
+
+  useEffect(() => {
+    if (mapExpanded) {
+      setMapRegion(initialRegion(selectedCity));
+    }
+  }, [mapExpanded, selectedCity]);
 
   useEffect(() => {
     if (!mapExpanded && pendingNavId) {
@@ -213,13 +237,24 @@ export default function DiscoverScreen() {
 
       <Modal visible={mapExpanded} animationType="slide" onRequestClose={() => setMapExpanded(false)}>
         <View style={{ flex: 1, backgroundColor: "#000" }}>
-          <Pressable style={styles.modalClose} onPress={() => setMapExpanded(false)}>
-            <Text style={styles.modalCloseText}>Close Map</Text>
-          </Pressable>
+          <View style={styles.modalActionsLeft}>
+            <Pressable style={styles.modalActionButton} onPress={() => setMapExpanded(false)}>
+              <Text style={styles.modalCloseText}>Close Map</Text>
+            </Pressable>
+          </View>
+          {showListOverlay && (
+            <View style={styles.hideListContainer}>
+              <Pressable style={styles.modalActionButton} onPress={() => setShowListOverlay(false)}>
+                <Text style={styles.modalCloseText}>Hide list</Text>
+              </Pressable>
+            </View>
+          )}
           <MapView
+            key={selectedCity ?? "default-map"}
             style={{ flex: 1 }}
             provider={PROVIDER_GOOGLE}
             initialRegion={initialRegion(selectedCity)}
+            onRegionChangeComplete={(region) => setMapRegion(region)}
           >
             {(events ?? []).map((evt) => {
               if (evt.latitude == null || evt.longitude == null) return null;
@@ -257,6 +292,36 @@ export default function DiscoverScreen() {
               )}
               <Pressable style={styles.sheetButton} onPress={() => handleOpenEvent(selectedEvent.id)}>
                 <Text style={styles.sheetButtonText}>Open event</Text>
+              </Pressable>
+            </View>
+          )}
+            {showListOverlay && (
+              <View style={styles.overlayList}>
+                <View style={styles.overlayHeader}>
+                  <Text style={styles.overlayTitle}>Events in view</Text>
+                  <Pressable onPress={() => setShowListOverlay(false)}><Text style={styles.overlayClose}>Close</Text></Pressable>
+                </View>
+                <FlatList
+                  data={visibleEvents}
+                keyExtractor={(item) => item.id}
+                ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
+                renderItem={({ item }) => (
+                  <Pressable
+                    style={({ pressed }) => [styles.card, pressed && { opacity: 0.9 }]}
+                    onPress={() => handleOpenEvent(item.id)}
+                  >
+                    <Text style={styles.cardTitle}>{item.title}</Text>
+                    {item.category && <Text style={styles.cardMeta}>{item.category}</Text>}
+                    <Text style={styles.cardMeta}>{item.location?.name ?? "Unknown location"}</Text>
+                  </Pressable>
+                )}
+              />
+              </View>
+            )}
+          {!showListOverlay && (
+            <View style={styles.listToggleContainer}>
+              <Pressable style={styles.modalActionButton} onPress={() => setShowListOverlay(true)}>
+                <Text style={styles.modalCloseText}>Show list</Text>
               </Pressable>
             </View>
           )}
@@ -444,17 +509,58 @@ const styles = StyleSheet.create({
   },
   cardTitle: { fontSize: 16, fontWeight: "600" },
   cardMeta: { fontSize: 13, color: "#555" },
-  modalClose: {
+  modalCloseText: { color: "#fff", fontWeight: "600" },
+  modalActions: {
     position: "absolute",
-    top: 50,
-    right: 20,
+    top: 40,
+    right: 12,
     zIndex: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    flexDirection: "row",
+    gap: 8,
+  },
+  modalActionButton: {
     backgroundColor: "rgba(0,0,0,0.6)",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
     borderRadius: 10,
   },
-  modalCloseText: { color: "#fff", fontWeight: "600" },
+  modalActionsLeft: {
+    position: "absolute",
+    top: 40,
+    left: 12,
+    zIndex: 10,
+    flexDirection: "row",
+    gap: 8,
+  },
+  listToggleContainer: {
+    position: "absolute",
+    bottom: 24,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    zIndex: 10,
+  },
+  hideListContainer: {
+    position: "absolute",
+    top: 40,
+    right: 12,
+    zIndex: 10,
+  },
+  overlayList: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    maxHeight: Dimensions.get("window").height * 0.5,
+    backgroundColor: "#fff",
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: 12,
+    gap: 8,
+  },
+  overlayHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  overlayTitle: { fontSize: 16, fontWeight: "700" },
+  overlayClose: { color: "#3949ab", fontWeight: "600" },
   sheet: {
     position: "absolute",
     bottom: 0,
