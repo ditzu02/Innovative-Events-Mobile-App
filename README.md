@@ -54,3 +54,29 @@ The account screen shows basic profile information and lists events the user has
 - Create tables in your Postgres DB: `psql \"$DB_NAME\" -f server/schema.sql` (ensure the role has privileges to create the `pgcrypto` extension).
 - Run the Flask API: `cd server && python main.py`. Health check: `GET /health`. Events endpoint (DB-backed): `GET /api/events`.
 - Seed sample data: `cd server && python seed_db.py` (uses the same `.env` DB credentials). Seeds locations, events, tags, and event_tags.
+
+
+## Architecture
+- Client: Expo/React Native (Expo Router, react-native-maps, @react-native-community/datetimepicker).
+- Server: Flask + Postgres (Supabase) with psycopg2 connection pool.
+- API endpoints:
+  - `GET /health` — JSON status/db state.
+  - `GET /api/test-db` — DB connectivity test; returns server time.
+  - `GET /api/events` — list events with filters: tag, category, city, date (YYYY-MM-DD), time (HH:MM contained in start/end window), min_rating, sort (soonest/toprated/price). Returns location summary, tags, rating/price, lat/lng for pins.
+  - `GET /api/events/:id` — event detail with location, tags, artists, photos, reviews summary/latest, rating/price/time window.
+
+## DB schema
+- Core tables: `events` (title, category, start/end, description, cover_image_url, price, rating avg/count, location_id), `locations` (name, address, lat/lng, features, cover image, rating avg/count).
+- Relationships: `event_tags`, `tags`; `event_artists`, `artists`; `event_photos`; `reviews`; `saved_events`.
+- Seed data includes Vienna venues/events, artists, tags, reviews, photos, saved events.
+
+## Screens
+- Discover/Explore: city typeahead; expandable filters (date/time pickers, tags, category, min rating, sort); map preview + full map with pins; in-view list overlay; list synced to filters.
+- Event detail: hero with overlay, tags, primary/secondary CTAs, location/price/rating info card, about, artists, photos, reviews.
+
+## Roadmap
+- Auth & roles: user/admin, verified artist/host; admin CRUD/approval; image upload/storage.
+- Core flows: saved events endpoints + Saved tab; reviews POST + composer; search/autocomplete; better city autocomplete from DB.
+- Map & discovery: persistent map with bottom sheet, center-on-me, clustering, richer cards (distance/price/rating), empty states.
+- Accounts & profiles: user profile (avatar, saved, reviews), artist/host pages, venue pages (amenities/accessibility/directions), notifications.
+- Polish: date/time formatting, timezone handling, error states, performance/caching for `/api/events`.
