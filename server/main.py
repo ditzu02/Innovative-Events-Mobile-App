@@ -3,6 +3,8 @@ import logging
 import os
 from pathlib import Path
 from decimal import Decimal
+import math
+import uuid
 
 import psycopg2
 from psycopg2 import OperationalError, InterfaceError
@@ -140,6 +142,38 @@ def execute_with_retry(query: str, params: tuple = ()) -> tuple:
         raise
 
 
+def get_user_id() -> str | None:
+    """Extract user id from request headers or query params."""
+    user_id = request.headers.get("X-User-Id") or request.args.get("user_id")
+    if not user_id:
+        return None
+    user_id = user_id.strip()
+    return user_id or None
+
+
+def extract_city(address: str | None) -> str | None:
+    if not address:
+        return None
+    parts = [part.strip() for part in address.split(",") if part.strip()]
+    if not parts:
+        return None
+    if len(parts) >= 2:
+        return parts[-2]
+    return parts[0]
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_lat1 = math.radians(lat1)
+    r_lon1 = math.radians(lon1)
+    r_lat2 = math.radians(lat2)
+    r_lon2 = math.radians(lon2)
+    d_lat = r_lat2 - r_lat1
+    d_lon = r_lon2 - r_lon1
+    a = math.sin(d_lat / 2) ** 2 + math.cos(r_lat1) * math.cos(r_lat2) * math.sin(d_lon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    return 6371 * c
+
+
 # Initialize pool on startup to fail fast if DB is unreachable
 init_db_pool()
 
@@ -190,6 +224,70 @@ def test_db():
         if connection:
             release_db_connection(connection)
 
+@app.route("/api/filters")
+def list_filters():
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT DISTINCT category
+            FROM events
+            WHERE category IS NOT NULL
+            ORDER BY category ASC
+            """
+        )
+        categories = [row[0] for row in cursor.fetchall()]
+
+        cursor.execute("SELECT name FROM tags ORDER BY name ASC")
+        tags = [row[0] for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT address, latitude, longitude
+            FROM locations
+            WHERE address IS NOT NULL
+            """
+        )
+        city_stats: dict[str, dict[str, float]] = {}
+        for address, latitude, longitude in cursor.fetchall():
+            city = extract_city(address)
+            if not city:
+                continue
+            if latitude is None or longitude is None:
+                continue
+            if city not in city_stats:
+                city_stats[city] = {"sum_lat": 0.0, "sum_lng": 0.0, "count": 0.0}
+            city_stats[city]["sum_lat"] += float(latitude)
+            city_stats[city]["sum_lng"] += float(longitude)
+            city_stats[city]["count"] += 1.0
+
+        cities = []
+        for name, stats in city_stats.items():
+            if stats["count"] <= 0:
+                continue
+            cities.append(
+                {
+                    "name": name,
+                    "latitude": stats["sum_lat"] / stats["count"],
+                    "longitude": stats["sum_lng"] / stats["count"],
+                }
+            )
+        cities.sort(key=lambda item: item["name"].lower())
+
+        return jsonify({"tags": tags, "categories": categories, "cities": cities})
+    except Exception:
+        logger.exception("Failed to fetch filters")
+        return jsonify({"error": "Unable to fetch filters"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
 @app.route("/api/events")
 def list_events():
     connection = None
@@ -218,6 +316,7 @@ def list_events():
                 e.end_time,
                 e.description,
                 e.cover_image_url,
+                e.ticket_url,
                 e.price,
                 e.rating_avg,
                 e.rating_count,
@@ -242,6 +341,31 @@ def list_events():
 
         filters = []
         params = []
+        lat_val = None
+        lng_val = None
+        radius_km = None
+
+        lat_param = request.args.get("lat")
+        lng_param = request.args.get("lng")
+        if lat_param or lng_param:
+            if not lat_param or not lng_param:
+                return jsonify({"error": "lat and lng are required together"}), 400
+            try:
+                lat_val = float(lat_param)
+                lng_val = float(lng_param)
+            except ValueError:
+                return jsonify({"error": "lat and lng must be numbers"}), 400
+
+        radius_param = request.args.get("radius_km")
+        if radius_param:
+            if lat_val is None or lng_val is None:
+                return jsonify({"error": "radius_km requires lat and lng"}), 400
+            try:
+                radius_km = float(radius_param)
+            except ValueError:
+                return jsonify({"error": "radius_km must be a number"}), 400
+            if radius_km <= 0:
+                return jsonify({"error": "radius_km must be greater than 0"}), 400
 
         category = request.args.get("category")
         if category:
@@ -257,6 +381,21 @@ def list_events():
         if city:
             filters.append("COALESCE(l.address, '') ILIKE %s")
             params.append(f"%{city}%")
+
+        search_query = request.args.get("q")
+        if search_query:
+            term = f"%{search_query}%"
+            filters.append(
+                "("
+                "e.title ILIKE %s OR "
+                "e.description ILIKE %s OR "
+                "e.category ILIKE %s OR "
+                "COALESCE(l.name, '') ILIKE %s OR "
+                "COALESCE(l.address, '') ILIKE %s OR "
+                "array_to_string(COALESCE(ta.tags, '{}'), ' ') ILIKE %s"
+                ")"
+            )
+            params.extend([term, term, term, term, term, term])
 
         date_str = request.args.get("date")
         if date_str:
@@ -289,7 +428,10 @@ def list_events():
             query += " AND " + " AND ".join(filters)
 
         sort = request.args.get("sort", "soonest")
-        if sort == "toprated":
+        sort_distance = sort in ("distance", "nearest")
+        if sort_distance:
+            query += " ORDER BY e.start_time ASC"
+        elif sort == "toprated":
             query += " ORDER BY COALESCE(ra.review_avg, e.rating_avg) DESC NULLS LAST, e.start_time ASC"
         elif sort == "price":
             query += " ORDER BY e.price ASC NULLS LAST, e.start_time ASC"
@@ -326,6 +468,184 @@ def list_events():
                 end_time,
                 description,
                 cover_image_url,
+                ticket_url,
+                price,
+                rating_avg,
+                rating_count,
+                location_id,
+                location_name,
+                location_address,
+                location_latitude,
+                location_longitude,
+                location_features,
+                location_cover_image_url,
+                location_rating_avg,
+                location_rating_count,
+                tags,
+                review_avg,
+                review_count,
+            ) = row
+
+            location = None
+            if location_id:
+                location = {
+                    "id": str(location_id),
+                    "name": location_name,
+                    "address": location_address,
+                    "latitude": float(location_latitude) if location_latitude is not None else None,
+                    "longitude": float(location_longitude) if location_longitude is not None else None,
+                    "features": location_features,
+                    "cover_image_url": location_cover_image_url,
+                    "rating_avg": float(location_rating_avg) if location_rating_avg is not None else None,
+                    "rating_count": location_rating_count,
+                }
+
+            distance_km = None
+            if lat_val is not None and lng_val is not None:
+                if location_latitude is not None and location_longitude is not None:
+                    distance_km = haversine_km(
+                        lat_val,
+                        lng_val,
+                        float(location_latitude),
+                        float(location_longitude),
+                    )
+
+            events.append(
+                {
+                    "id": str(event_id),
+                    "title": title,
+                    "category": category,
+                    "start_time": start_time.isoformat() if start_time else None,
+                    "end_time": end_time.isoformat() if end_time else None,
+                    "description": description,
+                    "cover_image_url": cover_image_url,
+                    "ticket_url": ticket_url,
+                    "price": float(price) if isinstance(price, Decimal) or isinstance(price, (int, float)) else None,
+                    "rating_avg": float(review_avg) if review_avg is not None else float(rating_avg) if rating_avg is not None else None,
+                    "rating_count": review_count if review_count is not None else rating_count,
+                    "tags": tags or [],
+                    "location": location,
+                    "latitude": float(location_latitude) if location_latitude is not None else None,
+                    "longitude": float(location_longitude) if location_longitude is not None else None,
+                    "distance_km": distance_km,
+                }
+            )
+
+        if radius_km is not None:
+            events = [
+                event
+                for event in events
+                if event["distance_km"] is not None and event["distance_km"] <= radius_km
+            ]
+
+        if sort_distance and lat_val is not None and lng_val is not None:
+            events.sort(
+                key=lambda item: item["distance_km"] if item["distance_km"] is not None else float("inf")
+            )
+
+        return jsonify({"events": events})
+    except PoolError:
+        logger.exception("Connection pool unavailable while fetching events")
+        return jsonify({"error": "Database unavailable, please retry"}), 503
+    except Exception:
+        logger.exception("Failed to fetch events")
+        return jsonify({"error": "Unable to fetch events"}), 500
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                logger.exception("Failed to close cursor")
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/saved", methods=["GET", "POST"])
+def saved_events():
+    connection = None
+    cursor = None
+    user_id = get_user_id()
+    if not user_id:
+        return jsonify({"error": "Missing user id"}), 400
+    try:
+        if request.method == "POST":
+            payload = request.get_json(silent=True) or {}
+            event_id = payload.get("event_id")
+            if not event_id:
+                return jsonify({"error": "event_id is required"}), 400
+            connection = get_db_connection()
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO saved_events (user_id, event_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, event_id) DO NOTHING
+                """,
+                (user_id, event_id),
+            )
+            connection.commit()
+            return jsonify({"saved": True})
+
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        query = """
+            WITH tag_agg AS (
+                SELECT et.event_id, array_remove(array_agg(DISTINCT t.name), NULL) AS tags
+                FROM event_tags et
+                JOIN tags t ON t.id = et.tag_id
+                GROUP BY et.event_id
+            ),
+            review_agg AS (
+                SELECT event_id, COUNT(*) AS review_count, AVG(rating) AS review_avg
+                FROM reviews
+                GROUP BY event_id
+            )
+            SELECT
+                e.id,
+                e.title,
+                e.category,
+                e.start_time,
+                e.end_time,
+                e.description,
+                e.cover_image_url,
+                e.ticket_url,
+                e.price,
+                e.rating_avg,
+                e.rating_count,
+                l.id AS location_id,
+                l.name AS location_name,
+                l.address AS location_address,
+                l.latitude AS location_latitude,
+                l.longitude AS location_longitude,
+                l.features AS location_features,
+                l.cover_image_url AS location_cover_image_url,
+                l.rating_avg AS location_rating_avg,
+                l.rating_count AS location_rating_count,
+                COALESCE(ta.tags, '{}') AS tags,
+                ra.review_avg,
+                ra.review_count
+            FROM saved_events se
+            JOIN events e ON e.id = se.event_id
+            LEFT JOIN locations l ON e.location_id = l.id
+            LEFT JOIN tag_agg ta ON ta.event_id = e.id
+            LEFT JOIN review_agg ra ON ra.event_id = e.id
+            WHERE se.user_id = %s
+            ORDER BY se.created_at DESC
+        """
+        cursor.execute(query, (user_id,))
+        rows = cursor.fetchall()
+
+        events = []
+        for row in rows:
+            (
+                event_id,
+                title,
+                category,
+                start_time,
+                end_time,
+                description,
+                cover_image_url,
+                ticket_url,
                 price,
                 rating_avg,
                 rating_count,
@@ -366,6 +686,7 @@ def list_events():
                     "end_time": end_time.isoformat() if end_time else None,
                     "description": description,
                     "cover_image_url": cover_image_url,
+                    "ticket_url": ticket_url,
                     "price": float(price) if isinstance(price, Decimal) or isinstance(price, (int, float)) else None,
                     "rating_avg": float(review_avg) if review_avg is not None else float(rating_avg) if rating_avg is not None else None,
                     "rating_count": review_count if review_count is not None else rating_count,
@@ -377,18 +698,155 @@ def list_events():
             )
 
         return jsonify({"events": events})
-    except PoolError:
-        logger.exception("Connection pool unavailable while fetching events")
-        return jsonify({"error": "Database unavailable, please retry"}), 503
     except Exception:
-        logger.exception("Failed to fetch events")
-        return jsonify({"error": "Unable to fetch events"}), 500
+        logger.exception("Saved events request failed")
+        return jsonify({"error": "Unable to handle saved events"}), 500
     finally:
         if cursor:
             try:
                 cursor.close()
             except Exception:
                 logger.exception("Failed to close cursor")
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/saved/<event_id>", methods=["GET", "DELETE"])
+def saved_event(event_id: str):
+    connection = None
+    cursor = None
+    user_id = get_user_id()
+    if not user_id:
+        return jsonify({"error": "Missing user id"}), 400
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        if request.method == "GET":
+            cursor.execute(
+                "SELECT 1 FROM saved_events WHERE user_id = %s AND event_id = %s",
+                (user_id, event_id),
+            )
+            saved = cursor.fetchone() is not None
+            return jsonify({"saved": saved})
+
+        cursor.execute(
+            "DELETE FROM saved_events WHERE user_id = %s AND event_id = %s",
+            (user_id, event_id),
+        )
+        connection.commit()
+        return jsonify({"saved": False})
+    except Exception:
+        logger.exception("Saved event toggle failed")
+        return jsonify({"error": "Unable to update saved event"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/events/<event_id>/reviews", methods=["POST"])
+def create_review(event_id: str):
+    connection = None
+    cursor = None
+    user_id = get_user_id()
+    if not user_id:
+        return jsonify({"error": "Missing user id"}), 400
+    try:
+        uuid.UUID(user_id)
+    except ValueError:
+        return jsonify({"error": "Invalid user id"}), 400
+
+    payload = request.get_json(silent=True) or {}
+    rating = payload.get("rating")
+    if rating is None:
+        return jsonify({"error": "rating is required"}), 400
+    try:
+        rating_val = int(rating)
+    except (TypeError, ValueError):
+        return jsonify({"error": "rating must be an integer"}), 400
+    if rating_val < 1 or rating_val > 5:
+        return jsonify({"error": "rating must be between 1 and 5"}), 400
+
+    comment = payload.get("comment")
+    if comment is not None:
+        comment = str(comment).strip()
+        if not comment:
+            comment = None
+
+    photos = payload.get("photos")
+    if photos is not None:
+        if not isinstance(photos, list):
+            return jsonify({"error": "photos must be a list"}), 400
+        cleaned = []
+        for photo in photos:
+            if photo is None:
+                continue
+            item = str(photo).strip()
+            if item:
+                cleaned.append(item)
+        photos = cleaned or None
+
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1 FROM events WHERE id = %s", (event_id,))
+        if not cursor.fetchone():
+            return jsonify({"error": "Event not found"}), 404
+
+        cursor.execute(
+            """
+            INSERT INTO reviews (event_id, user_id, rating, comment, photos)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, created_at
+            """,
+            (event_id, user_id, rating_val, comment, photos),
+        )
+        review_row = cursor.fetchone()
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS review_count,
+                   COALESCE(AVG(rating), 0) AS rating_avg
+            FROM reviews
+            WHERE event_id = %s
+            """,
+            (event_id,),
+        )
+        summary_row = cursor.fetchone()
+        review_count = summary_row[0] if summary_row else 0
+        rating_avg = float(summary_row[1]) if summary_row and summary_row[1] is not None else 0.0
+
+        cursor.execute(
+            """
+            UPDATE events
+            SET rating_avg = %s,
+                rating_count = %s
+            WHERE id = %s
+            """,
+            (rating_avg, review_count, event_id),
+        )
+
+        connection.commit()
+
+        return jsonify(
+            {
+                "review": {
+                    "id": str(review_row[0]) if review_row else None,
+                    "rating": rating_val,
+                    "comment": comment,
+                    "photos": photos,
+                    "created_at": review_row[1].isoformat() if review_row else None,
+                },
+                "summary": {"count": review_count, "rating_avg": rating_avg},
+            }
+        )
+    except Exception:
+        logger.exception("Failed to create review")
+        return jsonify({"error": "Unable to create review"}), 500
+    finally:
+        if cursor:
+            cursor.close()
         if connection:
             release_db_connection(connection)
 
@@ -411,6 +869,7 @@ def event_detail(event_id: str):
                 e.end_time,
                 e.description,
                 e.cover_image_url,
+                e.ticket_url,
                 e.price,
                 e.rating_avg,
                 e.rating_count,
@@ -441,6 +900,7 @@ def event_detail(event_id: str):
             end_time,
             description,
             cover_image_url,
+            ticket_url,
             price,
             rating_avg,
             rating_count,
@@ -558,6 +1018,7 @@ def event_detail(event_id: str):
             "end_time": end_time.isoformat() if end_time else None,
             "description": description,
             "cover_image_url": cover_image_url,
+            "ticket_url": ticket_url,
             "price": float(price) if isinstance(price, Decimal) or isinstance(price, (int, float)) else None,
             "rating_avg": float(rating_avg) if rating_avg is not None else None,
             "rating_count": rating_count,

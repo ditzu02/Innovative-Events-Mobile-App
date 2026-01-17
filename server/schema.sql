@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS events (
     end_time TIMESTAMPTZ NOT NULL,
     description TEXT,
     cover_image_url TEXT,
+    ticket_url TEXT,
     price NUMERIC,
     rating_avg NUMERIC DEFAULT 0,
     rating_count INTEGER DEFAULT 0,

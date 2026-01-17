@@ -1,4 +1,4 @@
-import { API_BASE_URL } from "@/constants/config";
+import { API_BASE_URL, USER_ID } from "@/constants/config";
 
 export class ApiError extends Error {
   status: number;
@@ -26,7 +26,11 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 
   try {
     const url = `${API_BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
-    const response = await fetch(url, { ...rest, signal: controller.signal });
+    const headers = new Headers(rest.headers ?? {});
+    if (USER_ID && !headers.has("X-User-Id")) {
+      headers.set("X-User-Id", USER_ID);
+    }
+    const response = await fetch(url, { ...rest, headers, signal: controller.signal });
 
     if (!response.ok) {
       const text = await response.text();

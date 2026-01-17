@@ -1,15 +1,23 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Image,
+  KeyboardAvoidingView,
+  Linking,
+  Platform,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
+  TextInput,
   View,
   Pressable,
 } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { useHeaderHeight } from "@react-navigation/elements";
 import { request } from "@/lib/api";
+import { USER_ID } from "@/constants/config";
 
 type EventDetail = {
   id: string;
@@ -19,6 +27,7 @@ type EventDetail = {
   end_time: string | null;
   description: string | null;
   cover_image_url?: string | null;
+  ticket_url?: string | null;
   price?: number | null;
   rating_avg?: number | null;
   rating_count?: number | null;
@@ -47,25 +56,218 @@ type EventDetail = {
 export default function EventDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
+  const headerHeight = useHeaderHeight();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [saveLoading, setSaveLoading] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const canSave = Boolean(USER_ID);
+  const canReview = Boolean(USER_ID);
+  const [showReviewForm, setShowReviewForm] = useState(false);
+  const [reviewRating, setReviewRating] = useState<number | null>(null);
+  const [reviewComment, setReviewComment] = useState("");
+  const [reviewPhotos, setReviewPhotos] = useState("");
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [reviewSuccess, setReviewSuccess] = useState<string | null>(null);
+  const [pendingReviewScroll, setPendingReviewScroll] = useState(false);
+  const scrollRef = useRef<ScrollView>(null);
+  const reviewSectionY = useRef<number | null>(null);
+  const reviewFormY = useRef<number | null>(null);
+  const commentInputOffsetY = useRef<number | null>(null);
+  const photosInputOffsetY = useRef<number | null>(null);
 
-  useEffect(() => {
+  const ticketUrl = event?.ticket_url?.trim() ?? "";
+  const directionsUrl = getDirectionsUrl(event);
+
+  const scrollToY = useCallback((y: number | null | undefined) => {
+    if (y == null) return;
+    scrollRef.current?.scrollTo({ y: Math.max(0, y - 16), animated: true });
+  }, []);
+
+  const getReviewInputY = useCallback((offset: number | null) => {
+    if (reviewSectionY.current == null || reviewFormY.current == null || offset == null) return null;
+    return reviewSectionY.current + reviewFormY.current + offset;
+  }, []);
+
+  const fetchEvent = useCallback(async (showLoader = true) => {
     if (!id) return;
-    (async () => {
-      try {
-        const data = await request<{ event: EventDetail }>(`/api/events/${id}`, { timeoutMs: 12000 });
-        setEvent(data.event);
-        setError(null);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        setError(message);
-      } finally {
+    if (showLoader) {
+      setLoading(true);
+    }
+    try {
+      const data = await request<{ event: EventDetail }>(`/api/events/${id}`, { timeoutMs: 12000 });
+      setEvent(data.event);
+      setError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+    } finally {
+      if (showLoader) {
         setLoading(false);
       }
-    })();
+    }
   }, [id]);
+
+  useEffect(() => {
+    fetchEvent(true);
+  }, [fetchEvent]);
+
+  useEffect(() => {
+    if (!pendingReviewScroll) return;
+    scrollToY(reviewSectionY.current);
+    setPendingReviewScroll(false);
+  }, [pendingReviewScroll, scrollToY]);
+
+  useEffect(() => {
+    if (!id || !canSave) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await request<{ saved: boolean }>(`/api/saved/${id}`, { timeoutMs: 8000 });
+        if (!cancelled) {
+          setSaved(Boolean(data.saved));
+          setSaveError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : "Unknown error";
+          setSaveError(message);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id, canSave, request]);
+
+  const handleToggleSave = async () => {
+    if (!id || !canSave || saveLoading) return;
+    setSaveLoading(true);
+    try {
+      if (saved) {
+        await request(`/api/saved/${id}`, { method: "DELETE", timeoutMs: 12000 });
+        setSaved(false);
+      } else {
+        await request("/api/saved", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ event_id: id }),
+          timeoutMs: 12000,
+        });
+        setSaved(true);
+      }
+      setSaveError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setSaveError(message);
+    } finally {
+      setSaveLoading(false);
+    }
+  };
+
+  const handleOpenTickets = async () => {
+    if (!ticketUrl) {
+      Alert.alert("Tickets unavailable", "No ticket link is available for this event.");
+      return;
+    }
+    try {
+      setActionError(null);
+      const supported = await Linking.canOpenURL(ticketUrl);
+      if (!supported) {
+        throw new Error("Unable to open ticket link");
+      }
+      await Linking.openURL(ticketUrl);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to open tickets";
+      setActionError(message);
+    }
+  };
+
+  const handleOpenDirections = async () => {
+    if (!directionsUrl) {
+      Alert.alert("Directions unavailable", "No location data is available for this event.");
+      return;
+    }
+    try {
+      setActionError(null);
+      const supported = await Linking.canOpenURL(directionsUrl);
+      if (!supported) {
+        throw new Error("Unable to open maps");
+      }
+      await Linking.openURL(directionsUrl);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to open directions";
+      setActionError(message);
+    }
+  };
+
+  const handleShare = async () => {
+    if (!event) return;
+    try {
+      setActionError(null);
+      const messageParts = [
+        event.title,
+        formatTimeRange(event.start_time, event.end_time),
+        event.location?.name,
+        event.location?.address,
+      ].filter(Boolean) as string[];
+      if (ticketUrl) {
+        messageParts.push(`Tickets: ${ticketUrl}`);
+      }
+      await Share.share({ message: messageParts.join("\n") });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to share";
+      setActionError(message);
+    }
+  };
+
+  const handleSubmitReview = async () => {
+    if (!id) return;
+    if (!canReview) {
+      setReviewError("Set EXPO_PUBLIC_USER_ID to submit reviews.");
+      return;
+    }
+    if (!reviewRating) {
+      setReviewError("Select a rating before submitting.");
+      return;
+    }
+    setReviewSubmitting(true);
+    setReviewError(null);
+    setReviewSuccess(null);
+    try {
+      const photos = reviewPhotos
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      const payload: { rating: number; comment?: string; photos?: string[] } = {
+        rating: reviewRating,
+      };
+      const trimmedComment = reviewComment.trim();
+      if (trimmedComment) payload.comment = trimmedComment;
+      if (photos.length) payload.photos = photos;
+
+      await request(`/api/events/${id}/reviews`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        timeoutMs: 12000,
+      });
+      setReviewSuccess("Review submitted. Thanks!");
+      setReviewRating(null);
+      setReviewComment("");
+      setReviewPhotos("");
+      await fetchEvent(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setReviewError(message);
+    } finally {
+      setReviewSubmitting(false);
+    }
+  };
 
   return (
     <>
@@ -80,38 +282,47 @@ export default function EventDetailScreen() {
           ),
         }}
       />
-      <ScrollView contentContainerStyle={styles.container}>
-        {loading && (
-          <View style={styles.center}>
-            <ActivityIndicator />
-            <Text style={styles.message}>Loading event...</Text>
-          </View>
-        )}
+      <KeyboardAvoidingView
+        style={styles.keyboardAvoid}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={headerHeight + 8}
+      >
+        <ScrollView
+          ref={scrollRef}
+          contentContainerStyle={styles.container}
+          keyboardShouldPersistTaps="handled"
+        >
+          {loading && (
+            <View style={styles.center}>
+              <ActivityIndicator />
+              <Text style={styles.message}>Loading event...</Text>
+            </View>
+          )}
 
-        {!loading && error && <Text style={styles.error}>Error: {error}</Text>}
+          {!loading && error && <Text style={styles.error}>Error: {error}</Text>}
 
-        {!loading && !error && event && (
-          <View style={styles.content}>
-            {event.cover_image_url ? (
-              <View style={styles.heroWrap}>
-                <Image source={{ uri: event.cover_image_url }} style={styles.hero} resizeMode="cover" />
-                <View style={styles.heroOverlay} />
-                <View style={styles.heroText}>
-                  <Text style={styles.heroTitle}>{event.title}</Text>
-                  <Text style={styles.heroMeta}>
+          {!loading && !error && event && (
+            <View style={styles.content}>
+              {event.cover_image_url ? (
+                <View style={styles.heroWrap}>
+                  <Image source={{ uri: event.cover_image_url }} style={styles.hero} resizeMode="cover" />
+                  <View style={styles.heroOverlay} />
+                  <View style={styles.heroText}>
+                    <Text style={styles.heroTitle}>{event.title}</Text>
+                    <Text style={styles.heroMeta}>
+                      {event.category ?? "Uncategorized"} · {formatTimeRange(event.start_time, event.end_time)}
+                    </Text>
+                    {event.location?.name ? <Text style={styles.heroMeta}>{event.location.name}</Text> : null}
+                  </View>
+                </View>
+              ) : (
+                <>
+                  <Text style={styles.title}>{event.title}</Text>
+                  <Text style={styles.subtitle}>
                     {event.category ?? "Uncategorized"} · {formatTimeRange(event.start_time, event.end_time)}
                   </Text>
-                  {event.location?.name ? <Text style={styles.heroMeta}>{event.location.name}</Text> : null}
-                </View>
-              </View>
-            ) : (
-              <>
-                <Text style={styles.title}>{event.title}</Text>
-                <Text style={styles.subtitle}>
-                  {event.category ?? "Uncategorized"} · {formatTimeRange(event.start_time, event.end_time)}
-                </Text>
-              </>
-            )}
+                </>
+              )}
 
             {event.tags && event.tags.length > 0 && (
               <View style={styles.row}>
@@ -124,13 +335,56 @@ export default function EventDetailScreen() {
             )}
 
             <View style={styles.actionRow}>
-              <Pressable style={styles.primaryButton}>
-                <Text style={styles.primaryButtonText}>Buy Tickets</Text>
+              <Pressable
+                style={[styles.primaryButton, !ticketUrl && styles.primaryButtonDisabled]}
+                onPress={handleOpenTickets}
+                disabled={!ticketUrl}
+              >
+                <Text style={styles.primaryButtonText}>
+                  {ticketUrl ? "Buy Tickets" : "Tickets unavailable"}
+                </Text>
               </Pressable>
-              <Pressable style={styles.secondaryButton}>
-                <Text style={styles.secondaryButtonText}>Save</Text>
+              <Pressable
+                onPress={handleToggleSave}
+                disabled={!canSave || saveLoading}
+                style={({ pressed }) => [
+                  styles.secondaryButton,
+                  (!canSave || saveLoading) && styles.secondaryButtonDisabled,
+                  pressed && canSave && !saveLoading && { opacity: 0.9 },
+                ]}
+              >
+                <Text style={styles.secondaryButtonText}>
+                  {saveLoading ? "Saving..." : saved ? "Saved" : "Save"}
+                </Text>
               </Pressable>
             </View>
+            <View style={styles.secondaryActionRow}>
+              <Pressable
+                onPress={handleOpenDirections}
+                disabled={!directionsUrl}
+                style={({ pressed }) => [
+                  styles.tertiaryButton,
+                  (!directionsUrl || pressed) && styles.tertiaryButtonDisabled,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.tertiaryButtonText,
+                    !directionsUrl && styles.tertiaryButtonTextDisabled,
+                  ]}
+                >
+                  Directions
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={handleShare}
+                style={({ pressed }) => [styles.tertiaryButton, pressed && styles.tertiaryButtonDisabled]}
+              >
+                <Text style={styles.tertiaryButtonText}>Share</Text>
+              </Pressable>
+            </View>
+            {saveError && <Text style={styles.error}>Save error: {saveError}</Text>}
+            {actionError && <Text style={styles.error}>Action error: {actionError}</Text>}
 
             {(event.location || event.price != null || event.rating_avg != null) && (
               <View style={styles.infoCard}>
@@ -198,18 +452,166 @@ export default function EventDetailScreen() {
                 </Text>
                 {event.reviews.latest?.map((rev, idx) => (
                   <View key={idx} style={styles.reviewCard}>
-                    <Text style={styles.cardTitle}>⭐ {rev.rating}</Text>
+                    <Text style={styles.cardTitle}>Rating {rev.rating}</Text>
                     {rev.comment ? <Text style={styles.cardBody}>{rev.comment}</Text> : null}
                     {rev.created_at ? <Text style={styles.muted}>{rev.created_at}</Text> : null}
                   </View>
                 ))}
               </View>
             )}
-          </View>
-        )}
-      </ScrollView>
+
+            <View
+              style={styles.section}
+              onLayout={(event) => {
+                reviewSectionY.current = event.nativeEvent.layout.y;
+                if (pendingReviewScroll) {
+                  scrollToY(reviewSectionY.current);
+                  setPendingReviewScroll(false);
+                }
+              }}
+            >
+              <Text style={styles.sectionTitle}>Write a Review</Text>
+              {!canReview && (
+                <Text style={styles.muted}>
+                  Set EXPO_PUBLIC_USER_ID in your client env to submit reviews.
+                </Text>
+              )}
+              <Pressable
+                onPress={() => {
+                  setShowReviewForm((prev) => {
+                    const next = !prev;
+                    if (next) {
+                      setPendingReviewScroll(true);
+                    }
+                    return next;
+                  });
+                  setReviewError(null);
+                  setReviewSuccess(null);
+                }}
+                disabled={!canReview}
+                style={({ pressed }) => [
+                  styles.reviewToggle,
+                  (!canReview || pressed) && { opacity: 0.7 },
+                ]}
+              >
+                <Text style={styles.reviewToggleText}>
+                  {showReviewForm ? "Hide form" : "Add review"}
+                </Text>
+              </Pressable>
+              {showReviewForm && (
+                <View
+                  style={styles.reviewForm}
+                  onLayout={(event) => {
+                    reviewFormY.current = event.nativeEvent.layout.y;
+                  }}
+                >
+                  <Text style={styles.label}>Rating</Text>
+                  <View style={styles.ratingRow}>
+                    {[1, 2, 3, 4, 5].map((val) => (
+                      <Pressable
+                        key={val}
+                        onPress={() => {
+                          setReviewRating(val);
+                          setReviewError(null);
+                          setReviewSuccess(null);
+                        }}
+                        style={[
+                          styles.ratingChip,
+                          reviewRating === val && styles.ratingChipSelected,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.ratingChipText,
+                            reviewRating === val && styles.ratingChipTextSelected,
+                          ]}
+                        >
+                          {val}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  <Text style={styles.label}>Comment</Text>
+                  <TextInput
+                    value={reviewComment}
+                    onChangeText={(text) => {
+                      setReviewComment(text);
+                      setReviewSuccess(null);
+                    }}
+                    placeholder="Share your experience"
+                    multiline
+                    style={styles.input}
+                    onLayout={(event) => {
+                      commentInputOffsetY.current = event.nativeEvent.layout.y;
+                    }}
+                    onFocus={() => scrollToY(getReviewInputY(commentInputOffsetY.current))}
+                  />
+                  <Text style={styles.label}>Photo URLs (optional)</Text>
+                  <TextInput
+                    value={reviewPhotos}
+                    onChangeText={(text) => {
+                      setReviewPhotos(text);
+                      setReviewSuccess(null);
+                    }}
+                    placeholder="https://example.com/photo1.jpg, https://example.com/photo2.jpg"
+                    style={styles.input}
+                    onLayout={(event) => {
+                      photosInputOffsetY.current = event.nativeEvent.layout.y;
+                    }}
+                    onFocus={() => scrollToY(getReviewInputY(photosInputOffsetY.current))}
+                  />
+                  {reviewError && <Text style={styles.error}>Review error: {reviewError}</Text>}
+                  {reviewSuccess && <Text style={styles.success}>{reviewSuccess}</Text>}
+                  <Pressable
+                    onPress={handleSubmitReview}
+                    disabled={reviewSubmitting}
+                    style={({ pressed }) => [
+                      styles.submitButton,
+                      (pressed || reviewSubmitting) && { opacity: 0.8 },
+                    ]}
+                  >
+                    <Text style={styles.submitButtonText}>
+                      {reviewSubmitting ? "Submitting..." : "Submit Review"}
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+            </View>
+            </View>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
     </>
   );
+}
+
+function getDirectionsUrl(event: EventDetail | null): string | null {
+  if (!event?.location) return null;
+  const name = event.location.name ?? "";
+  const address = event.location.address ?? "";
+  const lat = event.location.latitude;
+  const lng = event.location.longitude;
+
+  if (lat != null && lng != null) {
+    const query = `${lat},${lng}`;
+    if (Platform.OS === "ios") {
+      return `http://maps.apple.com/?q=${encodeURIComponent(query)}`;
+    }
+    if (Platform.OS === "android") {
+      return `geo:${lat},${lng}?q=${encodeURIComponent(query)}`;
+    }
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+  }
+
+  if (!address && !name) return null;
+  const query = encodeURIComponent(`${name} ${address}`.trim());
+  if (Platform.OS === "ios") {
+    return `http://maps.apple.com/?q=${query}`;
+  }
+  if (Platform.OS === "android") {
+    return `geo:0,0?q=${query}`;
+  }
+  return `https://www.google.com/maps/search/?api=1&query=${query}`;
 }
 
 function formatTag(tag: string) {
@@ -231,6 +633,7 @@ function formatTimeRange(start: string | null, end: string | null) {
 }
 
 const styles = StyleSheet.create({
+  keyboardAvoid: { flex: 1 },
   container: { padding: 16, backgroundColor: "#f7f8fb" },
   center: { alignItems: "center", justifyContent: "center", gap: 8, paddingVertical: 40 },
   content: { gap: 16 },
@@ -255,6 +658,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: "center",
   },
+  primaryButtonDisabled: {
+    opacity: 0.6,
+  },
   primaryButtonText: { color: "#fff", fontWeight: "700", fontSize: 14 },
   secondaryButton: {
     width: 90,
@@ -265,11 +671,28 @@ const styles = StyleSheet.create({
     borderColor: "#3949ab",
     backgroundColor: "#eef2ff",
   },
+  secondaryButtonDisabled: {
+    opacity: 0.6,
+  },
   secondaryButtonText: { color: "#3949ab", fontWeight: "700", fontSize: 14 },
+  secondaryActionRow: { flexDirection: "row", gap: 10 },
+  tertiaryButton: {
+    flex: 1,
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#cfd5ff",
+    backgroundColor: "#f5f7ff",
+  },
+  tertiaryButtonText: { color: "#3949ab", fontWeight: "700", fontSize: 13 },
+  tertiaryButtonDisabled: { opacity: 0.6 },
+  tertiaryButtonTextDisabled: { color: "#9aa0b5" },
   section: { gap: 8 },
   sectionTitle: { fontSize: 16, fontWeight: "600" },
   body: { fontSize: 14, color: "#222" },
   muted: { fontSize: 12, color: "#666" },
+  label: { fontSize: 13, fontWeight: "600", color: "#333" },
   infoCard: {
     backgroundColor: "#fff",
     borderRadius: 14,
@@ -301,4 +724,52 @@ const styles = StyleSheet.create({
     gap: 4,
     backgroundColor: "#fafafa",
   },
+  reviewToggle: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: "#eef2ff",
+    marginTop: 4,
+  },
+  reviewToggleText: { color: "#3949ab", fontWeight: "700", fontSize: 13 },
+  reviewForm: {
+    marginTop: 8,
+    backgroundColor: "#fff",
+    borderRadius: 12,
+    padding: 12,
+    gap: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#e5e5e5",
+  },
+  ratingRow: { flexDirection: "row", gap: 8 },
+  ratingChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    backgroundColor: "#eef2ff",
+  },
+  ratingChipSelected: {
+    backgroundColor: "#3949ab",
+  },
+  ratingChipText: { fontSize: 12, color: "#3949ab", fontWeight: "600" },
+  ratingChipTextSelected: { color: "#fff" },
+  input: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#ccc",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    minHeight: 44,
+    backgroundColor: "#fff",
+  },
+  submitButton: {
+    marginTop: 4,
+    backgroundColor: "#3949ab",
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: "center",
+  },
+  submitButtonText: { color: "#fff", fontWeight: "700", fontSize: 14 },
+  success: { color: "#2e7d32", fontSize: 13 },
 });

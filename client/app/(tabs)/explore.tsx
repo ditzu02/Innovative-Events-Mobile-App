@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, FlatList, TextInput, Dimensions, Modal, Platform } from "react-native";
 import MapView, { Marker, PROVIDER_GOOGLE, Region, Callout } from "react-native-maps";
 import Slider from "@react-native-community/slider";
@@ -18,12 +18,22 @@ type Event = {
   city?: string | null;
   latitude?: number | null;
   longitude?: number | null;
+  distance_km?: number | null;
 };
 
-const TAG_OPTIONS = ["Rock", "Jazz", "Outdoor", "Dj", "Live", "Electronic"];
-const CATEGORY_OPTIONS = ["Music", "Party", "Art"];
+type CityOption = { name: string; latitude: number; longitude: number };
+
+const FALLBACK_TAG_OPTIONS = ["Rock", "Jazz", "Outdoor", "Dj", "Live", "Electronic"];
+const FALLBACK_CATEGORY_OPTIONS = ["Music", "Party", "Art"];
 const RATING_OPTIONS = [4.5, 4, 3];
-const CITY_OPTIONS = ["Vienna", "San Francisco", "New York"];
+const FALLBACK_CITIES: CityOption[] = [
+  { name: "Vienna", latitude: 48.2082, longitude: 16.3738 },
+  { name: "San Francisco", latitude: 37.7749, longitude: -122.4194 },
+  { name: "New York", latitude: 40.7128, longitude: -74.006 },
+];
+const RADIUS_OPTIONS = [5, 10, 25, 50];
+const DEFAULT_REGION: Region = { latitude: 48.2082, longitude: 16.3738, latitudeDelta: 0.2, longitudeDelta: 0.2 };
+const USER_PIN_COLOR = "#2196f3";
 
 export default function DiscoverScreen() {
   const [events, setEvents] = useState<Event[] | null>(null);
@@ -32,8 +42,10 @@ export default function DiscoverScreen() {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedCity, setSelectedCity] = useState<string | null>(null);
   const [cityQuery, setCityQuery] = useState<string>("");
+  const [searchQuery, setSearchQuery] = useState<string>("");
   const [minRating, setMinRating] = useState<number | null>(null);
-  const [sort, setSort] = useState<"date" | "toprated" | "price">("date");
+  const [radiusKm, setRadiusKm] = useState<number | null>(null);
+  const [sort, setSort] = useState<"date" | "toprated" | "price" | "distance">("date");
   const [error, setError] = useState<string | null>(null);
   const [filtersExpanded, setFiltersExpanded] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
@@ -45,7 +57,73 @@ export default function DiscoverScreen() {
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null);
   const [pendingNavId, setPendingNavId] = useState<string | null>(null);
   const [showListOverlay, setShowListOverlay] = useState(false);
-  const [mapRegion, setMapRegion] = useState<Region>(() => initialRegion(null));
+  const [mapRegion, setMapRegion] = useState<Region>(() => DEFAULT_REGION);
+  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [availableTags, setAvailableTags] = useState<string[]>(FALLBACK_TAG_OPTIONS);
+  const [availableCategories, setAvailableCategories] = useState<string[]>(FALLBACK_CATEGORY_OPTIONS);
+  const [availableCities, setAvailableCities] = useState<CityOption[]>(FALLBACK_CITIES);
+  const [filtersError, setFiltersError] = useState<string | null>(null);
+  const mapRef = useRef<MapView | null>(null);
+  const mapRegionRef = useRef<Region>(DEFAULT_REGION);
+  const [mapReady, setMapReady] = useState(false);
+  const locationLabel = userLocation
+    ? `${userLocation.latitude.toFixed(4)}, ${userLocation.longitude.toFixed(4)}`
+    : "Not set";
+  const getRegionForCity = useCallback(
+    (city: string | null) => {
+      const base = { latitudeDelta: 0.2, longitudeDelta: 0.2 };
+      if (city) {
+        const match = availableCities.find((item) => item.name.toLowerCase() === city.toLowerCase());
+        if (match) {
+          return { latitude: match.latitude, longitude: match.longitude, ...base };
+        }
+      }
+      return { ...DEFAULT_REGION, ...base };
+    },
+    [availableCities]
+  );
+  const getPreviewRegion = useCallback(() => {
+    if (userLocation) {
+      return {
+        latitude: userLocation.latitude,
+        longitude: userLocation.longitude,
+        latitudeDelta: 0.2,
+        longitudeDelta: 0.2,
+      };
+    }
+    return getRegionForCity(selectedCity);
+  }, [userLocation, selectedCity, getRegionForCity]);
+  const getTargetRegion = useCallback(() => {
+    const current = mapRegionRef.current ?? DEFAULT_REGION;
+    if (userLocation) {
+      return {
+        latitude: userLocation.latitude,
+        longitude: userLocation.longitude,
+        latitudeDelta: current.latitudeDelta ?? 0.2,
+        longitudeDelta: current.longitudeDelta ?? 0.2,
+      };
+    }
+    const cityRegion = getRegionForCity(selectedCity);
+    return {
+      ...cityRegion,
+      latitudeDelta: current.latitudeDelta ?? cityRegion.latitudeDelta,
+      longitudeDelta: current.longitudeDelta ?? cityRegion.longitudeDelta,
+    };
+  }, [userLocation, selectedCity, getRegionForCity]);
+
+  const handleDropPin = useCallback((coordinate: { latitude: number; longitude: number }) => {
+    const nextRegion = {
+      latitude: coordinate.latitude,
+      longitude: coordinate.longitude,
+      latitudeDelta: mapRegionRef.current?.latitudeDelta ?? DEFAULT_REGION.latitudeDelta,
+      longitudeDelta: mapRegionRef.current?.longitudeDelta ?? DEFAULT_REGION.longitudeDelta,
+    };
+    setUserLocation(coordinate);
+    setMapRegion(nextRegion);
+    if (mapReady) {
+      mapRef.current?.animateToRegion(nextRegion, 250);
+    }
+  }, [mapReady]);
   const visibleEvents = useMemo(() => {
     if (!mapRegion || !events) return events ?? [];
     const { latitude, longitude, latitudeDelta, longitudeDelta } = mapRegion;
@@ -70,10 +148,48 @@ export default function DiscoverScreen() {
   };
 
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await request<{ tags: string[]; categories: string[]; cities: CityOption[] }>("/api/filters", {
+          timeoutMs: 12000,
+        });
+        if (cancelled) return;
+        setAvailableTags(data.tags?.length ? data.tags : FALLBACK_TAG_OPTIONS);
+        setAvailableCategories(data.categories?.length ? data.categories : FALLBACK_CATEGORY_OPTIONS);
+        setAvailableCities(data.cities?.length ? data.cities : FALLBACK_CITIES);
+        setFiltersError(null);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unable to load filters";
+        if (!cancelled) {
+          setFiltersError(message);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    mapRegionRef.current = mapRegion;
+  }, [mapRegion]);
+
+  useEffect(() => {
     if (mapExpanded) {
-      setMapRegion(initialRegion(selectedCity));
+      const target = getTargetRegion();
+      setMapRegion(target);
+      if (mapReady) {
+        mapRef.current?.animateToRegion(target, 250);
+      }
     }
-  }, [mapExpanded, selectedCity]);
+  }, [mapExpanded, getTargetRegion, mapReady]);
+
+  useEffect(() => {
+    if (selectedCity && !userLocation) {
+      setMapRegion(getRegionForCity(selectedCity));
+    }
+  }, [selectedCity, userLocation, getRegionForCity]);
 
   useEffect(() => {
     if (!mapExpanded && pendingNavId) {
@@ -83,11 +199,23 @@ export default function DiscoverScreen() {
     }
   }, [mapExpanded, pendingNavId, router]);
 
+  useEffect(() => {
+    if (!userLocation) {
+      if (sort === "distance") {
+        setSort("date");
+      }
+      if (radiusKm != null) {
+        setRadiusKm(null);
+      }
+    }
+  }, [userLocation, sort, radiusKm]);
+
   const fetchEvents = useMemo(
     () => async () => {
       setLoading(true);
       try {
         const searchParams = new URLSearchParams();
+        const trimmedSearch = searchQuery.trim();
         if (selectedTag) searchParams.append("tag", selectedTag.toLowerCase());
         if (selectedCategory) searchParams.append("category", selectedCategory);
         if (selectedCity) searchParams.append("city", selectedCity);
@@ -95,6 +223,14 @@ export default function DiscoverScreen() {
         if (selectedDate) searchParams.append("date", selectedDate.toISOString().split("T")[0]);
         if (selectedTime) searchParams.append("time", formatTime(selectedTime));
         if (minRating != null) searchParams.append("min_rating", String(minRating));
+        if (trimmedSearch) searchParams.append("q", trimmedSearch);
+        if (userLocation) {
+          searchParams.append("lat", String(userLocation.latitude));
+          searchParams.append("lng", String(userLocation.longitude));
+        }
+        if (radiusKm != null && userLocation && !mapExpanded) {
+          searchParams.append("radius_km", String(radiusKm));
+        }
         const qs = searchParams.toString();
         const data = await request<{ events: Event[] }>(qs ? `/api/events?${qs}` : "/api/events", { timeoutMs: 20000 });
         setEvents(data.events ?? []);
@@ -107,7 +243,7 @@ export default function DiscoverScreen() {
         setLoading(false);
       }
     },
-    [selectedTag, selectedCategory, selectedCity, selectedDate, selectedTime, sort, minRating]
+    [selectedTag, selectedCategory, selectedCity, selectedDate, selectedTime, sort, minRating, searchQuery, radiusKm, userLocation, mapExpanded]
   );
 
   useEffect(() => {
@@ -120,10 +256,42 @@ export default function DiscoverScreen() {
       <Text style={styles.subtitle}>Filters → map preview → list. Expand map to browse pins.</Text>
 
       <View style={styles.filterCard}>
+        <View style={{ gap: 6 }}>
+          <Text style={styles.chipLabel}>Search</Text>
+          <TextInput
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            placeholder="Search events, venues, tags"
+            style={styles.input}
+          />
+        </View>
+        <View style={{ gap: 6 }}>
+          <Text style={styles.chipLabel}>Your location pin</Text>
+          <View style={styles.badgeRow}>
+            <Text style={styles.pinText}>{locationLabel}</Text>
+            <Pressable style={styles.badge} onPress={() => setMapExpanded(true)}>
+              <Text style={styles.badgeText}>{userLocation ? "Move pin" : "Drop pin"}</Text>
+            </Pressable>
+            {userLocation && (
+              <Pressable
+                style={styles.badge}
+                onPress={() => {
+                  setUserLocation(null);
+                  setRadiusKm(null);
+                }}
+              >
+                <Text style={styles.badgeText}>Clear</Text>
+              </Pressable>
+            )}
+          </View>
+          {!userLocation && (
+            <Text style={styles.subtitle}>Drop a pin on the map to enable distance filters.</Text>
+          )}
+        </View>
         <CityTypeahead
           query={cityQuery}
           selected={selectedCity}
-          options={CITY_OPTIONS}
+          options={availableCities.map((city) => city.name)}
           onSelect={(val) => {
             setSelectedCity(val);
             setCityQuery(val ?? "");
@@ -136,6 +304,7 @@ export default function DiscoverScreen() {
         <Pressable style={styles.expandButton} onPress={() => setFiltersExpanded((prev) => !prev)}>
           <Text style={styles.expandText}>{filtersExpanded ? "Hide filters" : "More filters"}</Text>
         </Pressable>
+        {filtersError && <Text style={styles.subtitle}>Filters unavailable: {filtersError}</Text>}
 
         {filtersExpanded && (
           <View style={{ gap: 12 }}>
@@ -193,13 +362,13 @@ export default function DiscoverScreen() {
 
             <FilterChips
               label="Tags"
-              options={TAG_OPTIONS}
+              options={availableTags}
               selected={selectedTag}
               onSelect={(val) => setSelectedTag(val)}
             />
             <FilterChips
               label="Category"
-              options={CATEGORY_OPTIONS}
+              options={availableCategories}
               selected={selectedCategory}
               onSelect={(val) => setSelectedCategory(val)}
             />
@@ -216,20 +385,75 @@ export default function DiscoverScreen() {
                 onValueChange={(val) => setMinRating(val === 0 ? null : val)}
               />
             </View>
+            <View style={{ gap: 6 }}>
+              <Text style={styles.chipLabel}>Near your pin</Text>
+              <View style={styles.badgeRow}>
+                <Pressable
+                  onPress={() => setRadiusKm(null)}
+                  style={[styles.badge, radiusKm == null && { backgroundColor: "#3949ab" }]}
+                >
+                  <Text style={[styles.badgeText, radiusKm == null && { color: "#fff" }]}>Any</Text>
+                </Pressable>
+                {RADIUS_OPTIONS.map((radius) => {
+                  const selected = radiusKm === radius;
+                  const disabled = !userLocation;
+                  return (
+                    <Pressable
+                      key={radius}
+                      onPress={() => {
+                        if (!userLocation) {
+                          setMapExpanded(true);
+                          return;
+                        }
+                        setRadiusKm(selected ? null : radius);
+                      }}
+                      style={[
+                        styles.badge,
+                        selected && { backgroundColor: "#3949ab" },
+                        disabled && styles.badgeDisabled,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.badgeText,
+                          selected && { color: "#fff" },
+                          disabled && styles.badgeDisabledText,
+                        ]}
+                      >
+                        {radius} km
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
             <FilterChips
               label="Sort"
-              options={["Date", "Top rated", "Price"]}
+              options={["Date", "Top rated", "Price", "Distance"]}
               selected={sortLabel(sort)}
-              onSelect={(val) => setSort(labelToSort(val))}
+              disabledOptions={!userLocation ? ["Distance"] : []}
+              onSelect={(val) => {
+                if (!val) {
+                  setSort("date");
+                  return;
+                }
+                if (val.toLowerCase() === "distance" && !userLocation) {
+                  setMapExpanded(true);
+                  return;
+                }
+                setSort(labelToSort(val));
+              }}
             />
             <Pressable style={styles.clearButton} onPress={() => {
               setSelectedTag(null);
               setSelectedCategory(null);
               setSelectedCity(null);
               setCityQuery("");
+              setSearchQuery("");
               setSelectedDate(null);
               setSelectedTime(null);
               setMinRating(null);
+              setRadiusKm(null);
               setSort("date");
             }}>
               <Text style={styles.clearText}>Clear</Text>
@@ -240,13 +464,16 @@ export default function DiscoverScreen() {
 
       <Pressable style={styles.mapPreview} onPress={() => setMapExpanded(true)}>
         <Text style={styles.mapTitle}>Map Preview</Text>
-        <Text style={styles.mapSubtitle}>Tap to open map</Text>
+        <Text style={styles.mapSubtitle}>Tap to open map. Long-press to drop your pin.</Text>
         <MapView
           style={styles.mapMini}
           provider={PROVIDER_GOOGLE}
           pointerEvents="none"
-          region={initialRegion(selectedCity)}
+          region={getPreviewRegion()}
         >
+          {userLocation && (
+            <Marker coordinate={userLocation} title="Your location" pinColor={USER_PIN_COLOR} />
+          )}
           {(events ?? []).map((evt) => {
             if (evt.latitude == null || evt.longitude == null) return null;
             return (
@@ -283,6 +510,9 @@ export default function DiscoverScreen() {
               <Text style={styles.cardTitle}>{item.title}</Text>
               {item.category && <Text style={styles.cardMeta}>{item.category}</Text>}
               <Text style={styles.cardMeta}>{item.location?.name ?? "Unknown location"}</Text>
+              {item.distance_km != null && (
+                <Text style={styles.cardMeta}>{item.distance_km.toFixed(1)} km away</Text>
+              )}
               <View style={styles.badgeRow}>
                 {item.tags?.slice(0, 3).map((tag) => (
                   <View key={tag} style={styles.badge}><Text style={styles.badgeText}>{tag}</Text></View>
@@ -302,6 +532,17 @@ export default function DiscoverScreen() {
             <Pressable style={styles.modalActionButton} onPress={() => setMapExpanded(false)}>
               <Text style={styles.modalCloseText}>Close Map</Text>
             </Pressable>
+            {userLocation && (
+              <Pressable
+                style={styles.modalActionButton}
+                onPress={() => {
+                  setUserLocation(null);
+                  setRadiusKm(null);
+                }}
+              >
+                <Text style={styles.modalCloseText}>Clear pin</Text>
+              </Pressable>
+            )}
           </View>
           {showListOverlay && (
             <View style={styles.hideListContainer}>
@@ -310,13 +551,45 @@ export default function DiscoverScreen() {
               </Pressable>
             </View>
           )}
+          <View style={styles.pinHint}>
+            <Text style={styles.pinHintText}>
+              {userLocation ? "Drag the pin to adjust your location." : "Long-press the map to drop your location pin."}
+            </Text>
+          </View>
           <MapView
-            key={selectedCity ?? "default-map"}
             style={{ flex: 1 }}
+            ref={mapRef}
             provider={PROVIDER_GOOGLE}
-            initialRegion={initialRegion(selectedCity)}
-            onRegionChangeComplete={(region) => setMapRegion(region)}
+            initialRegion={getPreviewRegion()}
+            onMapReady={() => {
+              setMapReady(true);
+              const target = getTargetRegion();
+              setMapRegion(target);
+              mapRef.current?.animateToRegion(target, 0);
+            }}
+            onRegionChangeComplete={(region) => {
+              if (!mapReady) return;
+              if (
+                !Number.isFinite(region.latitude) ||
+                !Number.isFinite(region.longitude) ||
+                !Number.isFinite(region.latitudeDelta) ||
+                !Number.isFinite(region.longitudeDelta)
+              ) {
+                return;
+              }
+              setMapRegion(region);
+            }}
+            onLongPress={(event) => handleDropPin(event.nativeEvent.coordinate)}
           >
+            {userLocation && (
+              <Marker
+                coordinate={userLocation}
+                title="Your location"
+                pinColor={USER_PIN_COLOR}
+                draggable
+                onDragEnd={(event) => handleDropPin(event.nativeEvent.coordinate)}
+              />
+            )}
             {(events ?? []).map((evt) => {
               if (evt.latitude == null || evt.longitude == null) return null;
               return (
@@ -374,6 +647,9 @@ export default function DiscoverScreen() {
                     <Text style={styles.cardTitle}>{item.title}</Text>
                     {item.category && <Text style={styles.cardMeta}>{item.category}</Text>}
                     <Text style={styles.cardMeta}>{item.location?.name ?? "Unknown location"}</Text>
+                    {item.distance_km != null && (
+                      <Text style={styles.cardMeta}>{item.distance_km.toFixed(1)} km away</Text>
+                    )}
                   </Pressable>
                 )}
               />
@@ -392,17 +668,19 @@ export default function DiscoverScreen() {
   );
 }
 
-function sortLabel(sort: "date" | "toprated" | "price") {
+function sortLabel(sort: "date" | "toprated" | "price" | "distance") {
   if (sort === "toprated") return "Top rated";
   if (sort === "price") return "Price";
+  if (sort === "distance") return "Distance";
   return "Date";
 }
 
-function labelToSort(label: string | null): "date" | "toprated" | "price" {
+function labelToSort(label: string | null): "date" | "toprated" | "price" | "distance" {
   if (!label) return "date";
   const l = label.toLowerCase();
   if (l === "top rated") return "toprated";
   if (l === "price") return "price";
+  if (l === "distance") return "distance";
   return "date";
 }
 
@@ -414,38 +692,41 @@ function formatTime(d: Date) {
   }
 }
 
-function initialRegion(city: string | null): Region {
-  const base = {
-    latitudeDelta: 0.2,
-    longitudeDelta: 0.2,
-  };
-  switch ((city ?? "").toLowerCase()) {
-    case "vienna":
-      return { latitude: 48.2082, longitude: 16.3738, ...base };
-    case "san francisco":
-      return { latitude: 37.7749, longitude: -122.4194, ...base };
-    case "new york":
-      return { latitude: 40.7128, longitude: -74.006, ...base };
-    default:
-      return { latitude: 48.2082, longitude: 16.3738, ...base };
-  }
-}
-
-type ChipsProps = { label: string; options: string[]; selected: string | null; onSelect: (val: string | null) => void };
-function FilterChips({ label, options, selected, onSelect }: ChipsProps) {
+type ChipsProps = {
+  label: string;
+  options: string[];
+  selected: string | null;
+  onSelect: (val: string | null) => void;
+  disabledOptions?: string[];
+};
+function FilterChips({ label, options, selected, onSelect, disabledOptions }: ChipsProps) {
+  const disabledSet = new Set((disabledOptions ?? []).map((opt) => opt.toLowerCase()));
   return (
     <View style={{ gap: 6 }}>
       <Text style={styles.chipLabel}>{label}</Text>
       <View style={styles.badgeRow}>
         {options.map((opt) => {
           const isSelected = selected?.toLowerCase() === opt.toLowerCase();
+          const isDisabled = disabledSet.has(opt.toLowerCase());
           return (
             <Pressable
               key={opt}
               onPress={() => onSelect(isSelected ? null : opt)}
-              style={[styles.badge, isSelected && { backgroundColor: "#3949ab" }]}
+              style={[
+                styles.badge,
+                isSelected && { backgroundColor: "#3949ab" },
+                isDisabled && styles.badgeDisabled,
+              ]}
             >
-              <Text style={[styles.badgeText, isSelected && { color: "#fff" }]}>{opt}</Text>
+              <Text
+                style={[
+                  styles.badgeText,
+                  isSelected && { color: "#fff" },
+                  isDisabled && styles.badgeDisabledText,
+                ]}
+              >
+                {opt}
+              </Text>
             </Pressable>
           );
         })}
@@ -521,6 +802,9 @@ const styles = StyleSheet.create({
     backgroundColor: "#eef2ff",
   },
   badgeText: { fontSize: 12, color: "#3949ab" },
+  badgeDisabled: { opacity: 0.6 },
+  badgeDisabledText: { color: "#9aa0b5" },
+  pinText: { fontSize: 12, color: "#333" },
   expandButton: {
     alignSelf: "flex-start",
     paddingHorizontal: 12,
@@ -600,6 +884,24 @@ const styles = StyleSheet.create({
     zIndex: 10,
     flexDirection: "row",
     gap: 8,
+  },
+  pinHint: {
+    position: "absolute",
+    top: 90,
+    left: 12,
+    right: 12,
+    zIndex: 10,
+    alignItems: "center",
+  },
+  pinHintText: {
+    color: "#fff",
+    fontSize: 12,
+    textAlign: "center",
+    backgroundColor: "rgba(0,0,0,0.5)",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    overflow: "hidden",
   },
   listToggleContainer: {
     position: "absolute",

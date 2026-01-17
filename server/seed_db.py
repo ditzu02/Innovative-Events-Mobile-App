@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import psycopg2
+from psycopg2.extras import Json
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +57,7 @@ def get_or_create_location(cur, data: Dict[str, Any]):
           data.get("address"),
           data["latitude"],
           data["longitude"],
-          data.get("features"),
+          Json(data.get("features")) if data.get("features") is not None else None,
           data.get("cover_image_url"),
           data.get("rating_avg", 0),
           data.get("rating_count", 0),
@@ -103,10 +104,11 @@ def get_or_create_event(cur, data: Dict[str, Any], location_id):
           end_time,
           description,
           cover_image_url,
+          ticket_url,
           price,
           rating_avg,
           rating_count
-      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
       RETURNING id;
       """,
       (
@@ -117,6 +119,7 @@ def get_or_create_event(cur, data: Dict[str, Any], location_id):
           data["end_time"],
           data.get("description"),
           data.get("cover_image_url"),
+          data.get("ticket_url"),
           data.get("price"),
           data.get("rating_avg", 0),
           data.get("rating_count", 0),
@@ -181,6 +184,7 @@ def main():
           "end_time": "2025-05-12T22:30:00Z",
           "description": "Retro-future synthwave night with live visuals and guest DJs.",
           "cover_image_url": "https://example.com/synthwave.jpg",
+          "ticket_url": "https://www.livetickets.ro/bilete/una-noche-caliente-14-feb-little-club-targu-mures",
           "price": 35,
           "rating_avg": 4.8,
           "rating_count": 95,
@@ -194,6 +198,7 @@ def main():
           "end_time": "2025-06-02T20:00:00Z",
           "description": "Curated waterfront art exhibits with live music and local vendors.",
           "cover_image_url": "https://example.com/art-walk.jpg",
+          "ticket_url": "https://example.com/tickets/harbor-lights",
           "price": 20,
           "rating_avg": 4.5,
           "rating_count": 64,
@@ -207,6 +212,7 @@ def main():
           "end_time": "2025-07-15T22:00:00Z",
           "description": "Acoustic sets from emerging artists with panoramic city views.",
           "cover_image_url": "https://example.com/skyline-sessions.jpg",
+          "ticket_url": "https://example.com/tickets/skyline-sessions",
           "price": 28,
           "rating_avg": 4.6,
           "rating_count": 81,
