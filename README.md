@@ -1,5 +1,25 @@
 # Innovative Events Mobile App
 
+## Summary
+An Expo/React Native app for discovering events with rich filters, a drop-pin map experience, and social features like saving and reviews.
+
+## Current features
+- Discover events with search, filters (date/time, category, tags, rating), and sorting (soonest, top rated, price, distance).
+- Drop a pin on the map to use it as the distance reference; apply radius filters and distance sorting.
+- Map preview + full-screen map with draggable pin and event callouts.
+- Event details with tickets, directions, sharing, saving, and reviews.
+- Saved events list with remove actions.
+- Pull-to-refresh and skeleton loading states on key screens.
+
+## Client setup
+- Create `client/.env` with:
+  - `EXPO_PUBLIC_API_URL=http://<your-ip>:5000`
+  - `EXPO_PUBLIC_USER_ID=<uuid>` (optional but required for saving and reviews)
+- Saved events and reviews use the `X-User-Id` header derived from `EXPO_PUBLIC_USER_ID`.
+- Install and run:
+  - `cd client && npm install`
+  - `cd client && npx expo start`
+
 ## Overview of Images
 
 <img width="483" height="792" alt="wireframe_map_discover" src="https://github.com/user-attachments/assets/931ab116-0d28-41eb-95a7-05ea9a00108d" />
@@ -62,21 +82,27 @@ The account screen shows basic profile information and lists events the user has
 - API endpoints:
   - `GET /health` — JSON status/db state.
   - `GET /api/test-db` — DB connectivity test; returns server time.
-  - `GET /api/events` — list events with filters: tag, category, city, date (YYYY-MM-DD), time (HH:MM contained in start/end window), min_rating, sort (soonest/toprated/price). Returns location summary, tags, rating/price, lat/lng for pins.
-  - `GET /api/events/:id` — event detail with location, tags, artists, photos, reviews summary/latest, rating/price/time window.
+  - `GET /api/filters` — list filter options (tags, categories, cities).
+  - `GET /api/events` — list events with filters: tag, category, city, date (YYYY-MM-DD), time (HH:MM contained in start/end window), min_rating, q, lat/lng, radius_km, sort (soonest/toprated/price/distance). Returns location summary, tags, rating/price, lat/lng, distance_km for pins.
+  - `GET /api/events/:id` — event detail with location, tags, artists, photos, reviews summary/latest, rating/price/time window, ticket_url.
+  - `POST /api/events/:id/reviews` — create a review (rating/comment/photos); updates aggregate rating.
+  - `GET /api/saved` — list saved events for the current user.
+  - `POST /api/saved` — save an event for the current user.
+  - `GET /api/saved/:id` — check if an event is saved.
+  - `DELETE /api/saved/:id` — remove a saved event.
 
 ## DB schema
-- Core tables: `events` (title, category, start/end, description, cover_image_url, price, rating avg/count, location_id), `locations` (name, address, lat/lng, features, cover image, rating avg/count).
+- Core tables: `events` (title, category, start/end, description, cover_image_url, ticket_url, price, rating avg/count, location_id), `locations` (name, address, lat/lng, features, cover image, rating avg/count).
 - Relationships: `event_tags`, `tags`; `event_artists`, `artists`; `event_photos`; `reviews`; `saved_events`.
 - Seed data includes Vienna venues/events, artists, tags, reviews, photos, saved events.
 
 ## Screens
-- Discover/Explore: city typeahead; expandable filters (date/time pickers, tags, category, min rating, sort); map preview + full map with pins; in-view list overlay; list synced to filters.
-- Event detail: hero with overlay, tags, primary/secondary CTAs, location/price/rating info card, about, artists, photos, reviews.
+- Discover/Explore: city typeahead; expandable filters (date/time pickers, tags, category, min rating, sort); search with debounce; reset/clear filters; map preview + full map with pins; long-press to drop pin; distance radius chips; in-view list overlay; pull-to-refresh; skeletons.
+- Event detail: hero with overlay, tags, ticket/share/directions CTAs, save action, location/price/rating info card, about, artists, photos, reviews, review composer, skeletons.
+- Saved: list of saved events with remove action, pull-to-refresh, empty state CTA.
 
 ## Roadmap
 - Auth & roles: user/admin, verified artist/host; admin CRUD/approval; image upload/storage.
-- Core flows: saved events endpoints + Saved tab; reviews POST + composer; search/autocomplete; better city autocomplete from DB.
-- Map & discovery: persistent map with bottom sheet, center-on-me, clustering, richer cards (distance/price/rating), empty states.
+- Map & discovery: persistent map with bottom sheet, center-on-me, clustering, richer cards (distance/price/rating).
 - Accounts & profiles: user profile (avatar, saved, reviews), artist/host pages, venue pages (amenities/accessibility/directions), notifications.
-- Polish: date/time formatting, timezone handling, error states, performance/caching for `/api/events`.
+- Polish: timezone handling, performance/caching for `/api/events`, accessibility improvements.
