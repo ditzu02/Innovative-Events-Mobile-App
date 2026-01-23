@@ -100,9 +100,3 @@ The account screen shows basic profile information and lists events the user has
 - Discover/Explore: city typeahead; expandable filters (date/time pickers, tags, category, min rating, sort); search with debounce; reset/clear filters; map preview + full map with pins; long-press to drop pin; distance radius chips; in-view list overlay; pull-to-refresh; skeletons.
 - Event detail: hero with overlay, tags, ticket/share/directions CTAs, save action, location/price/rating info card, about, artists, photos, reviews, review composer, skeletons.
 - Saved: list of saved events with remove action, pull-to-refresh, empty state CTA.
-
-## Roadmap
-- Auth & roles: user/admin, verified artist/host; admin CRUD/approval; image upload/storage.
-- Map & discovery: persistent map with bottom sheet, center-on-me, clustering, richer cards (distance/price/rating).
-- Accounts & profiles: user profile (avatar, saved, reviews), artist/host pages, venue pages (amenities/accessibility/directions), notifications.
-- Polish: timezone handling, performance/caching for `/api/events`, accessibility improvements.
