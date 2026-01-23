@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, FlatList, TextInput, Dimensions, Modal, Platform } from "react-native";
+import { View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, FlatList, TextInput, Dimensions, Modal, Platform, RefreshControl } from "react-native";
 import MapView, { Marker, PROVIDER_GOOGLE, Region, Callout } from "react-native-maps";
 import Slider from "@react-native-community/slider";
 import DateTimePicker from "@react-native-community/datetimepicker";
@@ -33,16 +33,29 @@ const FALLBACK_CITIES: CityOption[] = [
 ];
 const RADIUS_OPTIONS = [5, 10, 25, 50];
 const DEFAULT_REGION: Region = { latitude: 48.2082, longitude: 16.3738, latitudeDelta: 0.2, longitudeDelta: 0.2 };
-const USER_PIN_COLOR = "#2196f3";
+const PALETTE = {
+  background: "#0b0a12",
+  surface: "#151321",
+  surfaceAlt: "#1c1930",
+  line: "#2c2740",
+  text: "#f5f3ff",
+  muted: "#a2a1b4",
+  accent: "#8f6bff",
+  accentSoft: "#2b2446",
+  danger: "#ff6b6b",
+};
+const USER_PIN_COLOR = PALETTE.accent;
 
 export default function DiscoverScreen() {
   const [events, setEvents] = useState<Event[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedCity, setSelectedCity] = useState<string | null>(null);
   const [cityQuery, setCityQuery] = useState<string>("");
   const [searchQuery, setSearchQuery] = useState<string>("");
+  const [debouncedQuery, setDebouncedQuery] = useState<string>("");
   const [minRating, setMinRating] = useState<number | null>(null);
   const [radiusKm, setRadiusKm] = useState<number | null>(null);
   const [sort, setSort] = useState<"date" | "toprated" | "price" | "distance">("date");
@@ -146,6 +159,42 @@ export default function DiscoverScreen() {
     setPendingNavId(id);
     setMapExpanded(false);
   };
+  const handleClearFilters = useCallback(() => {
+    setSelectedTag(null);
+    setSelectedCategory(null);
+    setSelectedCity(null);
+    setCityQuery("");
+    setSearchQuery("");
+    setDebouncedQuery("");
+    setSelectedDate(null);
+    setSelectedTime(null);
+    setMinRating(null);
+    setRadiusKm(null);
+    setSort("date");
+  }, []);
+  const activeFilterCount = useMemo(() => {
+    let count = 0;
+    if (selectedTag) count += 1;
+    if (selectedCategory) count += 1;
+    if (selectedCity) count += 1;
+    if (selectedDate) count += 1;
+    if (selectedTime) count += 1;
+    if (minRating != null) count += 1;
+    if (radiusKm != null) count += 1;
+    if (sort !== "date") count += 1;
+    if (searchQuery.trim()) count += 1;
+    return count;
+  }, [
+    selectedTag,
+    selectedCategory,
+    selectedCity,
+    selectedDate,
+    selectedTime,
+    minRating,
+    radiusKm,
+    sort,
+    searchQuery,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -170,6 +219,12 @@ export default function DiscoverScreen() {
       cancelled = true;
     };
   }, []);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQuery(searchQuery);
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   useEffect(() => {
     mapRegionRef.current = mapRegion;
@@ -215,7 +270,7 @@ export default function DiscoverScreen() {
       setLoading(true);
       try {
         const searchParams = new URLSearchParams();
-        const trimmedSearch = searchQuery.trim();
+        const trimmedSearch = debouncedQuery.trim();
         if (selectedTag) searchParams.append("tag", selectedTag.toLowerCase());
         if (selectedCategory) searchParams.append("category", selectedCategory);
         if (selectedCity) searchParams.append("city", selectedCity);
@@ -243,15 +298,34 @@ export default function DiscoverScreen() {
         setLoading(false);
       }
     },
-    [selectedTag, selectedCategory, selectedCity, selectedDate, selectedTime, sort, minRating, searchQuery, radiusKm, userLocation, mapExpanded]
+    [selectedTag, selectedCategory, selectedCity, selectedDate, selectedTime, sort, minRating, debouncedQuery, radiusKm, userLocation, mapExpanded]
   );
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchEvents();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchEvents]);
 
   useEffect(() => {
     fetchEvents();
   }, [fetchEvents]);
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
+    <ScrollView
+      style={styles.screen}
+      contentContainerStyle={styles.container}
+      refreshControl={(
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={handleRefresh}
+          tintColor={PALETTE.accent}
+          colors={[PALETTE.accent]}
+        />
+      )}
+    >
       <Text style={styles.title}>Discover</Text>
       <Text style={styles.subtitle}>Filters → map preview → list. Expand map to browse pins.</Text>
 
@@ -262,6 +336,7 @@ export default function DiscoverScreen() {
             value={searchQuery}
             onChangeText={setSearchQuery}
             placeholder="Search events, venues, tags"
+            placeholderTextColor={PALETTE.muted}
             style={styles.input}
           />
         </View>
@@ -302,12 +377,32 @@ export default function DiscoverScreen() {
           }}
         />
         <Pressable style={styles.expandButton} onPress={() => setFiltersExpanded((prev) => !prev)}>
-          <Text style={styles.expandText}>{filtersExpanded ? "Hide filters" : "More filters"}</Text>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <Text style={styles.expandText}>{filtersExpanded ? "Hide filters" : "Filters"}</Text>
+            {activeFilterCount > 0 && (
+              <View style={styles.filterCountBadge}>
+                <Text style={styles.filterCountText}>{activeFilterCount}</Text>
+              </View>
+            )}
+          </View>
         </Pressable>
-        {filtersError && <Text style={styles.subtitle}>Filters unavailable: {filtersError}</Text>}
+        {filtersExpanded && filtersError && (
+          <View style={styles.notice}>
+            <Text style={styles.noticeText}>Filters unavailable: {filtersError}</Text>
+          </View>
+        )}
 
         {filtersExpanded && (
           <View style={{ gap: 12 }}>
+            <View style={styles.row}>
+              <Pressable
+                style={[styles.resetChip, activeFilterCount === 0 && styles.badgeDisabled]}
+                onPress={handleClearFilters}
+                disabled={activeFilterCount === 0}
+              >
+                <Text style={styles.resetChipText}>Reset filters</Text>
+              </Pressable>
+            </View>
             <View style={{ gap: 6 }}>
               <Text style={styles.chipLabel}>Date</Text>
               <View style={styles.row}>
@@ -326,8 +421,8 @@ export default function DiscoverScreen() {
                     value={selectedDate ?? new Date()}
                     mode="date"
                     display={Platform.OS === "ios" ? "inline" : "calendar"}
-                    themeVariant="light"
-                    textColor="#000"
+                    themeVariant="dark"
+                    textColor={PALETTE.text}
                     onChange={(_, date) => { setShowDatePicker(false); if (date) setSelectedDate(date); }}
                   />
                 </View>
@@ -352,8 +447,8 @@ export default function DiscoverScreen() {
                     value={selectedTime ?? new Date()}
                     mode="time"
                     display="spinner"
-                    themeVariant="light"
-                    textColor="#000"
+                    themeVariant="dark"
+                    textColor={PALETTE.text}
                     onChange={(_, date) => { setShowTimePicker(false); if (date) setSelectedTime(date); }}
                   />
                 </View>
@@ -379,9 +474,9 @@ export default function DiscoverScreen() {
                 minimumValue={0}
                 maximumValue={5}
                 step={0.5}
-                minimumTrackTintColor="#3949ab"
-                maximumTrackTintColor="#ccc"
-                thumbTintColor="#3949ab"
+                minimumTrackTintColor={PALETTE.accent}
+                maximumTrackTintColor={PALETTE.line}
+                thumbTintColor={PALETTE.accent}
                 onValueChange={(val) => setMinRating(val === 0 ? null : val)}
               />
             </View>
@@ -390,9 +485,9 @@ export default function DiscoverScreen() {
               <View style={styles.badgeRow}>
                 <Pressable
                   onPress={() => setRadiusKm(null)}
-                  style={[styles.badge, radiusKm == null && { backgroundColor: "#3949ab" }]}
+                  style={[styles.badge, radiusKm == null && styles.badgeSelected]}
                 >
-                  <Text style={[styles.badgeText, radiusKm == null && { color: "#fff" }]}>Any</Text>
+                  <Text style={[styles.badgeText, radiusKm == null && styles.badgeSelectedText]}>Any</Text>
                 </Pressable>
                 {RADIUS_OPTIONS.map((radius) => {
                   const selected = radiusKm === radius;
@@ -409,14 +504,14 @@ export default function DiscoverScreen() {
                       }}
                       style={[
                         styles.badge,
-                        selected && { backgroundColor: "#3949ab" },
+                        selected && styles.badgeSelected,
                         disabled && styles.badgeDisabled,
                       ]}
                     >
                       <Text
                         style={[
                           styles.badgeText,
-                          selected && { color: "#fff" },
+                          selected && styles.badgeSelectedText,
                           disabled && styles.badgeDisabledText,
                         ]}
                       >
@@ -444,26 +539,23 @@ export default function DiscoverScreen() {
                 setSort(labelToSort(val));
               }}
             />
-            <Pressable style={styles.clearButton} onPress={() => {
-              setSelectedTag(null);
-              setSelectedCategory(null);
-              setSelectedCity(null);
-              setCityQuery("");
-              setSearchQuery("");
-              setSelectedDate(null);
-              setSelectedTime(null);
-              setMinRating(null);
-              setRadiusKm(null);
-              setSort("date");
-            }}>
-              <Text style={styles.clearText}>Clear</Text>
+            {!userLocation && (
+              <Text style={styles.helperText}>Drop a pin to enable Distance sorting.</Text>
+            )}
+            <Pressable style={styles.clearButton} onPress={handleClearFilters}>
+              <Text style={styles.clearText}>Clear all</Text>
             </Pressable>
           </View>
         )}
       </View>
 
       <Pressable style={styles.mapPreview} onPress={() => setMapExpanded(true)}>
-        <Text style={styles.mapTitle}>Map Preview</Text>
+        <View style={styles.mapHeader}>
+          <Text style={styles.mapTitle}>Map Preview</Text>
+          <View style={styles.mapCta}>
+            <Text style={styles.mapCtaText}>Open map</Text>
+          </View>
+        </View>
         <Text style={styles.mapSubtitle}>Tap to open map. Long-press to drop your pin.</Text>
         <MapView
           style={styles.mapMini}
@@ -490,11 +582,39 @@ export default function DiscoverScreen() {
 
       <View style={styles.listHeader}>
         <Text style={styles.sectionTitle}>Events</Text>
-        {loading && <ActivityIndicator size="small" />}
+        {loading && <ActivityIndicator size="small" color={PALETTE.accent} />}
       </View>
       {error && <Text style={styles.error}>Error: {error}</Text>}
+      {loading && events === null && (
+        <View style={{ gap: 10 }}>
+          {[0, 1, 2].map((item) => (
+            <View key={item} style={styles.skeletonCard}>
+              <View style={[styles.skeletonLine, styles.skeletonLineWide]} />
+              <View style={styles.skeletonLine} />
+              <View style={styles.skeletonRow}>
+                <View style={styles.skeletonPill} />
+                <View style={styles.skeletonPill} />
+                <View style={styles.skeletonPill} />
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
       {events && events.length === 0 && !loading && !error && (
-        <Text style={styles.subtitle}>No events match the filters.</Text>
+        <View style={styles.emptyState}>
+          <Text style={styles.emptyTitle}>No events match the filters.</Text>
+          <Text style={styles.emptySubtitle}>
+            Try clearing filters or dropping a pin to widen the search.
+          </Text>
+          <View style={styles.emptyActions}>
+            <Pressable style={styles.emptyButton} onPress={handleClearFilters}>
+              <Text style={styles.emptyButtonText}>Clear filters</Text>
+            </Pressable>
+            <Pressable style={styles.emptyButton} onPress={() => setMapExpanded(true)}>
+              <Text style={styles.emptyButtonText}>Drop a pin</Text>
+            </Pressable>
+          </View>
+        </View>
       )}
       {events && events.length > 0 && (
         <FlatList
@@ -527,7 +647,7 @@ export default function DiscoverScreen() {
       )}
 
       <Modal visible={mapExpanded} animationType="slide" onRequestClose={() => setMapExpanded(false)}>
-        <View style={{ flex: 1, backgroundColor: "#000" }}>
+        <View style={styles.modalBackdrop}>
           <View style={styles.modalActionsLeft}>
             <Pressable style={styles.modalActionButton} onPress={() => setMapExpanded(false)}>
               <Text style={styles.modalCloseText}>Close Map</Text>
@@ -603,7 +723,7 @@ export default function DiscoverScreen() {
                     <View style={{ maxWidth: 200, padding: 4 }}>
                       <Text style={{ fontWeight: "700" }}>{evt.title}</Text>
                       <Text>{evt.location?.name ?? ""}</Text>
-                      <Text style={{ color: "#3949ab", marginTop: 4 }}>Details</Text>
+                      <Text style={{ color: PALETTE.accent, marginTop: 4 }}>Details</Text>
                     </View>
                   </Callout>
                 </Marker>
@@ -714,14 +834,14 @@ function FilterChips({ label, options, selected, onSelect, disabledOptions }: Ch
               onPress={() => onSelect(isSelected ? null : opt)}
               style={[
                 styles.badge,
-                isSelected && { backgroundColor: "#3949ab" },
+                isSelected && styles.badgeSelected,
                 isDisabled && styles.badgeDisabled,
               ]}
             >
               <Text
                 style={[
                   styles.badgeText,
-                  isSelected && { color: "#fff" },
+                  isSelected && styles.badgeSelectedText,
                   isDisabled && styles.badgeDisabledText,
                 ]}
               >
@@ -753,6 +873,7 @@ function CityTypeahead({ query, selected, options, onSelect, onChangeQuery }: Ci
         value={query}
         onChangeText={onChangeQuery}
         placeholder="Type a city"
+        placeholderTextColor={PALETTE.muted}
         style={styles.input}
       />
       {showSuggestions && (
@@ -763,9 +884,9 @@ function CityTypeahead({ query, selected, options, onSelect, onChangeQuery }: Ci
               <Pressable
                 key={opt}
                 onPress={() => onSelect(opt)}
-                style={[styles.badge, isSelected && { backgroundColor: "#3949ab" }]}
+                style={[styles.badge, isSelected && styles.badgeSelected]}
               >
-                <Text style={[styles.badgeText, isSelected && { color: "#fff" }]}>{opt}</Text>
+                <Text style={[styles.badgeText, isSelected && styles.badgeSelectedText]}>{opt}</Text>
               </Pressable>
             );
           })}
@@ -777,92 +898,193 @@ function CityTypeahead({ query, selected, options, onSelect, onChangeQuery }: Ci
 }
 
 const styles = StyleSheet.create({
-  container: { padding: 16, gap: 12 },
-  title: { fontSize: 22, fontWeight: "700" },
-  subtitle: { fontSize: 14, color: "#555" },
-  sectionTitle: { fontSize: 16, fontWeight: "600" },
+  screen: { backgroundColor: PALETTE.background, flex: 1 },
+  container: { padding: 16, gap: 12, paddingBottom: 24 },
+  title: { fontSize: 22, fontWeight: "700", color: PALETTE.text },
+  subtitle: { fontSize: 14, color: PALETTE.muted },
+  sectionTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
   filterCard: {
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     borderRadius: 12,
     padding: 12,
     gap: 12,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#e1e1e1",
+    borderColor: PALETTE.line,
     shadowColor: "#000",
-    shadowOpacity: 0.05,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
   },
-  chipLabel: { fontSize: 13, fontWeight: "600" },
+  chipLabel: { fontSize: 13, fontWeight: "600", color: PALETTE.muted },
   badgeRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
   badge: {
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 14,
-    backgroundColor: "#eef2ff",
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
-  badgeText: { fontSize: 12, color: "#3949ab" },
+  badgeText: { fontSize: 12, color: PALETTE.accent },
+  badgeSelected: {
+    backgroundColor: PALETTE.accent,
+    borderColor: PALETTE.accent,
+  },
+  badgeSelectedText: { color: "#fff" },
   badgeDisabled: { opacity: 0.6 },
-  badgeDisabledText: { color: "#9aa0b5" },
-  pinText: { fontSize: 12, color: "#333" },
+  badgeDisabledText: { color: PALETTE.muted },
+  pinText: { fontSize: 12, color: PALETTE.text },
+  helperText: { fontSize: 12, color: PALETTE.muted },
+  resetChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 14,
+    backgroundColor: PALETTE.accent,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.accent,
+  },
+  resetChipText: { color: "#fff", fontSize: 12, fontWeight: "700" },
+  row: { flexDirection: "row", gap: 8, flexWrap: "wrap", alignItems: "center" },
   expandButton: {
     alignSelf: "flex-start",
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 12,
-    backgroundColor: "#eef2ff",
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
-  expandText: { fontSize: 13, color: "#3949ab", fontWeight: "600" },
+  expandText: { fontSize: 13, color: PALETTE.accent, fontWeight: "600" },
+  filterCountBadge: {
+    minWidth: 22,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    alignItems: "center",
+  },
+  filterCountText: { color: PALETTE.accent, fontSize: 12, fontWeight: "700" },
+  notice: {
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  noticeText: { fontSize: 12, color: PALETTE.muted },
   clearButton: {
     alignSelf: "flex-start",
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 12,
-    backgroundColor: "#f0f0f0",
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
-  clearText: { fontSize: 13, color: "#333" },
+  clearText: { fontSize: 13, color: PALETTE.text },
   input: {
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#ccc",
+    borderColor: PALETTE.line,
     borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
+    color: PALETTE.text,
+    backgroundColor: PALETTE.surfaceAlt,
   },
-  expandButton: {
-    alignSelf: "flex-start",
+  skeletonCard: {
+    backgroundColor: PALETTE.surface,
+    borderRadius: 12,
+    padding: 12,
+    gap: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  skeletonLine: {
+    height: 10,
+    borderRadius: 6,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  skeletonLineWide: {
+    width: "70%",
+  },
+  skeletonRow: { flexDirection: "row", gap: 8 },
+  skeletonPill: {
+    height: 20,
+    width: 54,
+    borderRadius: 10,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  emptyState: {
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: PALETTE.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    gap: 8,
+  },
+  emptyTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
+  emptySubtitle: { fontSize: 13, color: PALETTE.muted },
+  emptyActions: { flexDirection: "row", gap: 10, flexWrap: "wrap", marginTop: 4 },
+  emptyButton: {
     paddingHorizontal: 12,
     paddingVertical: 8,
-    borderRadius: 12,
-    backgroundColor: "#eef2ff",
+    borderRadius: 10,
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
-  expandText: { fontSize: 13, color: "#3949ab", fontWeight: "600" },
-  mapPlaceholder: {
-    marginTop: 8,
+  emptyButtonText: { color: PALETTE.accent, fontWeight: "600", fontSize: 13 },
+  mapPreview: {
+    marginTop: 4,
+    backgroundColor: PALETTE.surface,
     borderRadius: 12,
-    padding: 16,
-    backgroundColor: "#0f172a",
+    padding: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    shadowColor: "#000",
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 2,
   },
-  mapTitle: { color: "#fff", fontSize: 16, fontWeight: "700" },
-  mapSubtitle: { color: "#dfe3f0", marginTop: 4 },
+  mapHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  mapTitle: { color: PALETTE.text, fontSize: 16, fontWeight: "700" },
+  mapCta: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  mapCtaText: { color: PALETTE.accent, fontSize: 12, fontWeight: "600" },
+  mapSubtitle: { color: PALETTE.muted, marginTop: 4 },
   mapMini: {
     marginTop: 10,
     width: "100%",
     height: 180,
     borderRadius: 12,
     overflow: "hidden",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
   listHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 12 },
   card: {
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     borderRadius: 12,
     padding: 12,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#e1e1e1",
+    borderColor: PALETTE.line,
     gap: 6,
   },
-  cardTitle: { fontSize: 16, fontWeight: "600" },
-  cardMeta: { fontSize: 13, color: "#555" },
-  modalCloseText: { color: "#fff", fontWeight: "600" },
+  cardTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
+  cardMeta: { fontSize: 13, color: PALETTE.muted },
+  error: { color: PALETTE.danger, fontSize: 13 },
+  modalBackdrop: { flex: 1, backgroundColor: PALETTE.background },
+  modalCloseText: { color: PALETTE.text, fontWeight: "600" },
   modalActions: {
     position: "absolute",
     top: 40,
@@ -872,7 +1094,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   modalActionButton: {
-    backgroundColor: "rgba(0,0,0,0.6)",
+    backgroundColor: "rgba(22,20,34,0.85)",
     paddingVertical: 8,
     paddingHorizontal: 12,
     borderRadius: 10,
@@ -894,10 +1116,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   pinHintText: {
-    color: "#fff",
+    color: PALETTE.text,
     fontSize: 12,
     textAlign: "center",
-    backgroundColor: "rgba(0,0,0,0.5)",
+    backgroundColor: "rgba(18,16,30,0.8)",
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 10,
@@ -923,40 +1145,46 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     maxHeight: Dimensions.get("window").height * 0.5,
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
     padding: 12,
     gap: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
   overlayHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  overlayTitle: { fontSize: 16, fontWeight: "700" },
-  overlayClose: { color: "#3949ab", fontWeight: "600" },
+  overlayTitle: { fontSize: 16, fontWeight: "700", color: PALETTE.text },
+  overlayClose: { color: PALETTE.accent, fontWeight: "600" },
   pickerWrap: {
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     borderRadius: 12,
     overflow: "hidden",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
   sheet: {
     position: "absolute",
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     padding: 16,
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
     gap: 8,
     minHeight: 200,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
   sheetHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  sheetTitle: { fontSize: 16, fontWeight: "700", flex: 1, marginRight: 8 },
+  sheetTitle: { fontSize: 16, fontWeight: "700", color: PALETTE.text, flex: 1, marginRight: 8 },
   sheetClose: { paddingHorizontal: 8, paddingVertical: 4 },
-  sheetCloseText: { color: "#3949ab", fontWeight: "600" },
-  sheetMeta: { fontSize: 13, color: "#555" },
+  sheetCloseText: { color: PALETTE.accent, fontWeight: "600" },
+  sheetMeta: { fontSize: 13, color: PALETTE.muted },
   sheetButton: {
     marginTop: 8,
-    backgroundColor: "#3949ab",
+    backgroundColor: PALETTE.accent,
     paddingVertical: 10,
     borderRadius: 10,
     alignItems: "center",

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from "react-native";
+import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
 import { request } from "@/lib/api";
@@ -23,12 +23,26 @@ type Event = {
   tags?: string[];
 };
 
+const PALETTE = {
+  background: "#0b0a12",
+  surface: "#151321",
+  surfaceAlt: "#1c1930",
+  line: "#2c2740",
+  text: "#f5f3ff",
+  muted: "#a2a1b4",
+  accent: "#8f6bff",
+  accentSoft: "#2b2446",
+  danger: "#ff6b6b",
+};
+
 export default function SavedScreen() {
   const router = useRouter();
   const [events, setEvents] = useState<Event[] | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<Record<string, boolean>>({});
+  const savedTitle = events ? `Saved Events (${events.length})` : "Saved Events";
 
   const fetchSaved = useCallback(async () => {
     if (!USER_ID) {
@@ -50,6 +64,14 @@ export default function SavedScreen() {
       setLoading(false);
     }
   }, [USER_ID, request]);
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchSaved();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchSaved]);
 
   useFocusEffect(
     useCallback(() => {
@@ -76,25 +98,51 @@ export default function SavedScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Saved Events</Text>
+      <Text style={styles.title}>{savedTitle}</Text>
 
-      {loading && (
-        <View style={styles.row}>
-          <ActivityIndicator size="small" />
-          <Text style={styles.message}>Loading saved events...</Text>
+      {loading && events === null && (
+        <View style={styles.skeletonList}>
+          {[0, 1, 2].map((item) => (
+            <View key={item} style={styles.skeletonCard}>
+              <View style={[styles.skeletonLine, styles.skeletonLineWide]} />
+              <View style={styles.skeletonLine} />
+              <View style={styles.skeletonRow}>
+                <View style={styles.skeletonPill} />
+                <View style={styles.skeletonPill} />
+                <View style={styles.skeletonPill} />
+              </View>
+              <View style={[styles.skeletonLine, styles.skeletonLineShort]} />
+            </View>
+          ))}
         </View>
       )}
 
       {!loading && error && <Text style={styles.error}>Error: {error}</Text>}
 
       {!loading && !error && events && events.length === 0 && (
-        <Text style={styles.message}>No saved events yet.</Text>
+        <View style={styles.emptyState}>
+          <Text style={styles.emptyTitle}>No saved events yet.</Text>
+          <Text style={styles.emptySubtitle}>
+            Explore events and tap Save to keep them here.
+          </Text>
+          <Pressable style={styles.emptyButton} onPress={() => router.push("/explore")}>
+            <Text style={styles.emptyButtonText}>Browse events</Text>
+          </Pressable>
+        </View>
       )}
 
       {events && events.length > 0 && (
         <FlatList
           data={events}
           keyExtractor={(item) => item.id}
+          refreshControl={(
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={handleRefresh}
+              tintColor={PALETTE.accent}
+              colors={[PALETTE.accent]}
+            />
+          )}
           ItemSeparatorComponent={() => <View style={styles.separator} />}
           renderItem={({ item }) => (
             <View style={styles.card}>
@@ -130,7 +178,7 @@ export default function SavedScreen() {
                     pressed && { opacity: 0.9 },
                   ]}
                 >
-                  <Text style={styles.secondaryButtonText}>Open</Text>
+                  <Text style={styles.secondaryButtonText}>Open event</Text>
                 </Pressable>
                 <Pressable
                   onPress={() => handleRemove(item.id)}
@@ -179,51 +227,93 @@ function formatTag(tag: string) {
 }
 
 const styles = StyleSheet.create({
-  container: { padding: 20, gap: 12 },
-  title: { fontSize: 20, fontWeight: "700" },
-  row: { flexDirection: "row", alignItems: "center", gap: 8 },
+  container: { padding: 20, gap: 12, flex: 1, backgroundColor: PALETTE.background },
+  title: { fontSize: 20, fontWeight: "700", color: PALETTE.text },
   rowWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  message: { fontSize: 14, color: "#555" },
-  error: { color: "red", fontSize: 14 },
-  card: {
+  error: { color: PALETTE.danger, fontSize: 14 },
+  skeletonList: { gap: 12 },
+  skeletonCard: {
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#ddd",
+    borderColor: PALETTE.line,
     borderRadius: 12,
     padding: 12,
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
+    gap: 10,
+  },
+  skeletonLine: {
+    height: 10,
+    borderRadius: 6,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  skeletonLineWide: { width: "70%" },
+  skeletonLineShort: { width: "45%" },
+  skeletonRow: { flexDirection: "row", gap: 8 },
+  skeletonPill: {
+    height: 20,
+    width: 54,
+    borderRadius: 10,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  card: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    borderRadius: 12,
+    padding: 12,
+    backgroundColor: PALETTE.surface,
     gap: 6,
   },
-  cardTitle: { fontSize: 16, fontWeight: "600" },
-  cardSubtitle: { fontSize: 13, color: "#555" },
+  cardTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
+  cardSubtitle: { fontSize: 13, color: PALETTE.muted },
   separator: { height: 10 },
   badge: {
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 12,
-    backgroundColor: "#eef2ff",
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
-  badgeText: { fontSize: 12, color: "#3949ab" },
+  badgeText: { fontSize: 12, color: PALETTE.accent },
   metaRow: { flexDirection: "row", gap: 12, alignItems: "center", marginTop: 4 },
-  metaText: { fontSize: 13, color: "#222" },
+  metaText: { fontSize: 13, color: PALETTE.text },
   actionRow: { flexDirection: "row", gap: 8, marginTop: 6 },
   secondaryButton: {
     flex: 1,
     borderRadius: 10,
     paddingVertical: 10,
     alignItems: "center",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#3949ab",
-    backgroundColor: "#eef2ff",
+    backgroundColor: PALETTE.accent,
   },
-  secondaryButtonText: { color: "#3949ab", fontWeight: "700" },
+  secondaryButtonText: { color: "#fff", fontWeight: "700" },
   removeButton: {
     flex: 1,
     borderRadius: 10,
     paddingVertical: 10,
     alignItems: "center",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#d32f2f",
-    backgroundColor: "#ffebee",
+    borderColor: PALETTE.danger,
+    backgroundColor: "rgba(255,107,107,0.15)",
   },
-  removeButtonText: { color: "#d32f2f", fontWeight: "700" },
+  removeButtonText: { color: PALETTE.danger, fontWeight: "700" },
+  emptyState: {
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: PALETTE.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    gap: 8,
+  },
+  emptyTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
+  emptySubtitle: { fontSize: 13, color: PALETTE.muted },
+  emptyButton: {
+    alignSelf: "flex-start",
+    marginTop: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  emptyButtonText: { color: PALETTE.accent, fontWeight: "600" },
 });

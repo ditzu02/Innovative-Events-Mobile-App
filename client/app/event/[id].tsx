@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Alert,
   Image,
   KeyboardAvoidingView,
@@ -53,6 +52,19 @@ type EventDetail = {
   };
 };
 
+const PALETTE = {
+  background: "#0b0a12",
+  surface: "#151321",
+  surfaceAlt: "#1c1930",
+  line: "#2c2740",
+  text: "#f5f3ff",
+  muted: "#a2a1b4",
+  accent: "#8f6bff",
+  accentSoft: "#2b2446",
+  success: "#39d5a4",
+  danger: "#ff6b6b",
+};
+
 export default function EventDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
@@ -63,7 +75,9 @@ export default function EventDetailScreen() {
   const [saved, setSaved] = useState(false);
   const [saveLoading, setSaveLoading] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const saveNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const canSave = Boolean(USER_ID);
   const canReview = Boolean(USER_ID);
   const [showReviewForm, setShowReviewForm] = useState(false);
@@ -92,6 +106,13 @@ export default function EventDetailScreen() {
     if (reviewSectionY.current == null || reviewFormY.current == null || offset == null) return null;
     return reviewSectionY.current + reviewFormY.current + offset;
   }, []);
+  const showSaveNotice = useCallback((message: string) => {
+    setSaveNotice(message);
+    if (saveNoticeTimer.current) {
+      clearTimeout(saveNoticeTimer.current);
+    }
+    saveNoticeTimer.current = setTimeout(() => setSaveNotice(null), 2200);
+  }, []);
 
   const fetchEvent = useCallback(async (showLoader = true) => {
     if (!id) return;
@@ -115,6 +136,13 @@ export default function EventDetailScreen() {
   useEffect(() => {
     fetchEvent(true);
   }, [fetchEvent]);
+  useEffect(() => {
+    return () => {
+      if (saveNoticeTimer.current) {
+        clearTimeout(saveNoticeTimer.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!pendingReviewScroll) return;
@@ -151,6 +179,7 @@ export default function EventDetailScreen() {
       if (saved) {
         await request(`/api/saved/${id}`, { method: "DELETE", timeoutMs: 12000 });
         setSaved(false);
+        showSaveNotice("Removed from saved.");
       } else {
         await request("/api/saved", {
           method: "POST",
@@ -159,6 +188,7 @@ export default function EventDetailScreen() {
           timeoutMs: 12000,
         });
         setSaved(true);
+        showSaveNotice("Saved to your list.");
       }
       setSaveError(null);
     } catch (err) {
@@ -275,9 +305,12 @@ export default function EventDetailScreen() {
         options={{
           title: event?.title ?? "Event",
           headerBackTitle: "Back",
+          headerShadowVisible: false,
+          headerStyle: { backgroundColor: PALETTE.background },
+          headerTitleStyle: { color: PALETTE.text },
           headerLeft: () => (
             <Pressable onPress={() => router.back()} style={{ paddingHorizontal: 8 }}>
-              <Text style={{ color: "#3949ab", fontWeight: "600" }}>Back</Text>
+              <Text style={{ color: PALETTE.accent, fontWeight: "600" }}>Back</Text>
             </Pressable>
           ),
         }}
@@ -291,11 +324,20 @@ export default function EventDetailScreen() {
           ref={scrollRef}
           contentContainerStyle={styles.container}
           keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
         >
           {loading && (
-            <View style={styles.center}>
-              <ActivityIndicator />
-              <Text style={styles.message}>Loading event...</Text>
+            <View style={styles.skeletonWrap}>
+              <View style={styles.skeletonHero} />
+              <View style={[styles.skeletonLine, styles.skeletonLineWide]} />
+              <View style={[styles.skeletonLine, styles.skeletonLineShort]} />
+              <View style={styles.skeletonRow}>
+                <View style={styles.skeletonPill} />
+                <View style={styles.skeletonPill} />
+                <View style={styles.skeletonPill} />
+              </View>
+              <View style={styles.skeletonCard} />
+              <View style={styles.skeletonCard} />
             </View>
           )}
 
@@ -383,8 +425,21 @@ export default function EventDetailScreen() {
                 <Text style={styles.tertiaryButtonText}>Share</Text>
               </Pressable>
             </View>
-            {saveError && <Text style={styles.error}>Save error: {saveError}</Text>}
-            {actionError && <Text style={styles.error}>Action error: {actionError}</Text>}
+            {saveError && (
+              <View style={[styles.feedback, styles.feedbackError]}>
+                <Text style={styles.feedbackText}>Save error: {saveError}</Text>
+              </View>
+            )}
+            {actionError && (
+              <View style={[styles.feedback, styles.feedbackError]}>
+                <Text style={styles.feedbackText}>Action error: {actionError}</Text>
+              </View>
+            )}
+            {saveNotice && (
+              <View style={[styles.feedback, styles.feedbackSuccess]}>
+                <Text style={styles.feedbackText}>{saveNotice}</Text>
+              </View>
+            )}
 
             {(event.location || event.price != null || event.rating_avg != null) && (
               <View style={styles.infoCard}>
@@ -472,9 +527,11 @@ export default function EventDetailScreen() {
             >
               <Text style={styles.sectionTitle}>Write a Review</Text>
               {!canReview && (
-                <Text style={styles.muted}>
-                  Set EXPO_PUBLIC_USER_ID in your client env to submit reviews.
-                </Text>
+                <View style={styles.notice}>
+                  <Text style={styles.noticeText}>
+                    Set EXPO_PUBLIC_USER_ID in your client env to submit reviews.
+                  </Text>
+                </View>
               )}
               <Pressable
                 onPress={() => {
@@ -495,7 +552,7 @@ export default function EventDetailScreen() {
                 ]}
               >
                 <Text style={styles.reviewToggleText}>
-                  {showReviewForm ? "Hide form" : "Add review"}
+                  {showReviewForm ? "Hide form" : "Write a review"}
                 </Text>
               </Pressable>
               {showReviewForm && (
@@ -539,6 +596,7 @@ export default function EventDetailScreen() {
                       setReviewSuccess(null);
                     }}
                     placeholder="Share your experience"
+                    placeholderTextColor={PALETTE.muted}
                     multiline
                     style={styles.input}
                     onLayout={(event) => {
@@ -554,14 +612,23 @@ export default function EventDetailScreen() {
                       setReviewSuccess(null);
                     }}
                     placeholder="https://example.com/photo1.jpg, https://example.com/photo2.jpg"
+                    placeholderTextColor={PALETTE.muted}
                     style={styles.input}
                     onLayout={(event) => {
                       photosInputOffsetY.current = event.nativeEvent.layout.y;
                     }}
                     onFocus={() => scrollToY(getReviewInputY(photosInputOffsetY.current))}
                   />
-                  {reviewError && <Text style={styles.error}>Review error: {reviewError}</Text>}
-                  {reviewSuccess && <Text style={styles.success}>{reviewSuccess}</Text>}
+                  {reviewError && (
+                    <View style={[styles.feedback, styles.feedbackError]}>
+                      <Text style={styles.feedbackText}>Review error: {reviewError}</Text>
+                    </View>
+                  )}
+                  {reviewSuccess && (
+                    <View style={[styles.feedback, styles.feedbackSuccess]}>
+                      <Text style={styles.feedbackText}>{reviewSuccess}</Text>
+                    </View>
+                  )}
                   <Pressable
                     onPress={handleSubmitReview}
                     disabled={reviewSubmitting}
@@ -633,27 +700,67 @@ function formatTimeRange(start: string | null, end: string | null) {
 }
 
 const styles = StyleSheet.create({
-  keyboardAvoid: { flex: 1 },
-  container: { padding: 16, backgroundColor: "#f7f8fb" },
-  center: { alignItems: "center", justifyContent: "center", gap: 8, paddingVertical: 40 },
+  keyboardAvoid: { flex: 1, backgroundColor: PALETTE.background },
+  container: { padding: 16, gap: 16, paddingBottom: 32 },
   content: { gap: 16 },
-  title: { fontSize: 22, fontWeight: "700" },
-  subtitle: { fontSize: 14, color: "#555" },
-  message: { fontSize: 14 },
-  error: { color: "red", fontSize: 14 },
-  heroWrap: { borderRadius: 16, overflow: "hidden", position: "relative" },
+  title: { fontSize: 22, fontWeight: "700", color: PALETTE.text },
+  subtitle: { fontSize: 14, color: PALETTE.muted },
+  error: { color: PALETTE.danger, fontSize: 14 },
+  skeletonWrap: { gap: 12 },
+  skeletonHero: {
+    height: 220,
+    borderRadius: 16,
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  skeletonLine: {
+    height: 10,
+    borderRadius: 6,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  skeletonLineWide: { width: "70%" },
+  skeletonLineShort: { width: "45%" },
+  skeletonRow: { flexDirection: "row", gap: 8 },
+  skeletonPill: {
+    height: 20,
+    width: 60,
+    borderRadius: 10,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  skeletonCard: {
+    height: 90,
+    borderRadius: 12,
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  heroWrap: {
+    borderRadius: 16,
+    overflow: "hidden",
+    position: "relative",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
   hero: { width: "100%", height: 260 },
-  heroOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.25)" },
+  heroOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.35)" },
   heroText: { position: "absolute", left: 16, bottom: 16, right: 16, gap: 4 },
   heroTitle: { fontSize: 22, fontWeight: "800", color: "#fff" },
-  heroMeta: { color: "#f0f0f0" },
+  heroMeta: { color: "#e0dbff" },
   row: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  badge: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, backgroundColor: "#eef2ff" },
-  badgeText: { fontSize: 12, color: "#3949ab" },
+  badge: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 14,
+    backgroundColor: PALETTE.accentSoft,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  badgeText: { fontSize: 12, color: PALETTE.accent },
   actionRow: { flexDirection: "row", gap: 10 },
   primaryButton: {
     flex: 1,
-    backgroundColor: "#3949ab",
+    backgroundColor: PALETTE.accent,
     paddingVertical: 12,
     borderRadius: 12,
     alignItems: "center",
@@ -668,13 +775,13 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     alignItems: "center",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#3949ab",
-    backgroundColor: "#eef2ff",
+    borderColor: PALETTE.accent,
+    backgroundColor: PALETTE.surfaceAlt,
   },
   secondaryButtonDisabled: {
     opacity: 0.6,
   },
-  secondaryButtonText: { color: "#3949ab", fontWeight: "700", fontSize: 14 },
+  secondaryButtonText: { color: PALETTE.accent, fontWeight: "700", fontSize: 14 },
   secondaryActionRow: { flexDirection: "row", gap: 10 },
   tertiaryButton: {
     flex: 1,
@@ -682,94 +789,125 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     alignItems: "center",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#cfd5ff",
-    backgroundColor: "#f5f7ff",
+    borderColor: PALETTE.line,
+    backgroundColor: PALETTE.surface,
   },
-  tertiaryButtonText: { color: "#3949ab", fontWeight: "700", fontSize: 13 },
+  tertiaryButtonText: { color: PALETTE.accent, fontWeight: "700", fontSize: 13 },
   tertiaryButtonDisabled: { opacity: 0.6 },
-  tertiaryButtonTextDisabled: { color: "#9aa0b5" },
+  tertiaryButtonTextDisabled: { color: PALETTE.muted },
   section: { gap: 8 },
-  sectionTitle: { fontSize: 16, fontWeight: "600" },
-  body: { fontSize: 14, color: "#222" },
-  muted: { fontSize: 12, color: "#666" },
-  label: { fontSize: 13, fontWeight: "600", color: "#333" },
+  sectionTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
+  body: { fontSize: 14, color: PALETTE.text },
+  muted: { fontSize: 12, color: PALETTE.muted },
+  label: { fontSize: 13, fontWeight: "600", color: PALETTE.muted },
   infoCard: {
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     borderRadius: 14,
     padding: 12,
     gap: 10,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#e5e5e5",
+    borderColor: PALETTE.line,
   },
   infoRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  infoLabel: { fontSize: 13, color: "#666", width: 90 },
-  infoValue: { fontSize: 14, color: "#222", flex: 1, textAlign: "right" },
+  infoLabel: { fontSize: 13, color: PALETTE.muted, width: 90 },
+  infoValue: { fontSize: 14, color: PALETTE.text, flex: 1, textAlign: "right" },
+  notice: {
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
+  noticeText: { color: PALETTE.muted, fontSize: 12 },
+  feedback: {
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  feedbackText: { fontSize: 12, color: PALETTE.text },
+  feedbackError: {
+    backgroundColor: "rgba(255,107,107,0.15)",
+    borderColor: PALETTE.danger,
+  },
+  feedbackSuccess: {
+    backgroundColor: "rgba(57,213,164,0.15)",
+    borderColor: PALETTE.success,
+  },
   card: {
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#ddd",
+    borderColor: PALETTE.line,
     borderRadius: 10,
     padding: 10,
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surfaceAlt,
     gap: 4,
   },
-  cardTitle: { fontSize: 14, fontWeight: "600" },
-  cardBody: { fontSize: 13, color: "#333" },
-  photo: { width: 180, height: 120, borderRadius: 10 },
+  cardTitle: { fontSize: 14, fontWeight: "600", color: PALETTE.text },
+  cardBody: { fontSize: 13, color: PALETTE.muted },
+  photo: {
+    width: 180,
+    height: 120,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+  },
   reviewCard: {
     marginTop: 8,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#ddd",
+    borderColor: PALETTE.line,
     borderRadius: 8,
     padding: 10,
     gap: 4,
-    backgroundColor: "#fafafa",
+    backgroundColor: PALETTE.surfaceAlt,
   },
   reviewToggle: {
     alignSelf: "flex-start",
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 12,
-    backgroundColor: "#eef2ff",
+    backgroundColor: PALETTE.accent,
     marginTop: 4,
   },
-  reviewToggleText: { color: "#3949ab", fontWeight: "700", fontSize: 13 },
+  reviewToggleText: { color: "#fff", fontWeight: "700", fontSize: 13 },
   reviewForm: {
     marginTop: 8,
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surface,
     borderRadius: 12,
     padding: 12,
     gap: 10,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#e5e5e5",
+    borderColor: PALETTE.line,
   },
-  ratingRow: { flexDirection: "row", gap: 8 },
+  ratingRow: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
   ratingChip: {
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 12,
-    backgroundColor: "#eef2ff",
+    backgroundColor: PALETTE.surfaceAlt,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
   },
   ratingChipSelected: {
-    backgroundColor: "#3949ab",
+    backgroundColor: PALETTE.accent,
+    borderColor: PALETTE.accent,
   },
-  ratingChipText: { fontSize: 12, color: "#3949ab", fontWeight: "600" },
+  ratingChipText: { fontSize: 12, color: PALETTE.text, fontWeight: "600" },
   ratingChipTextSelected: { color: "#fff" },
   input: {
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#ccc",
+    borderColor: PALETTE.line,
     borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
     minHeight: 44,
-    backgroundColor: "#fff",
+    backgroundColor: PALETTE.surfaceAlt,
+    color: PALETTE.text,
   },
   submitButton: {
     marginTop: 4,
-    backgroundColor: "#3949ab",
+    backgroundColor: PALETTE.accent,
     paddingVertical: 10,
     borderRadius: 10,
     alignItems: "center",
   },
   submitButtonText: { color: "#fff", fontWeight: "700", fontSize: 14 },
-  success: { color: "#2e7d32", fontSize: 13 },
 });
