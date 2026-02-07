@@ -14,8 +14,8 @@ An Expo/React Native app for discovering events with rich filters, a drop-pin ma
 ## Client setup
 - Create `client/.env` with:
   - `EXPO_PUBLIC_API_URL=http://<your-ip>:5000`
-  - `EXPO_PUBLIC_USER_ID=<uuid>` (optional but required for saving and reviews)
-- Saved events and reviews use the `X-User-Id` header derived from `EXPO_PUBLIC_USER_ID`.
+- Create an account in the app to save events and submit reviews.
+- Auth tokens are stored securely via `expo-secure-store`.
 - Install and run:
   - `cd client && npm install`
   - `cd client && npx expo start`
@@ -71,9 +71,16 @@ The account screen shows basic profile information and lists events the user has
 
 ## Backend setup (current)
 - Set DB env vars in `server/.env`: `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`, `DB_NAME`.
+- Set `JWT_SECRET` (required for login). Optional: `ACCESS_TOKEN_TTL_MIN`, `REFRESH_TOKEN_TTL_DAYS`.
 - Create tables in your Postgres DB: `psql \"$DB_NAME\" -f server/schema.sql` (ensure the role has privileges to create the `pgcrypto` extension).
 - Run the Flask API: `cd server && python main.py`. Health check: `GET /health`. Events endpoint (DB-backed): `GET /api/events`.
 - Seed sample data: `cd server && python seed_db.py` (uses the same `.env` DB credentials). Seeds locations, events, tags, and event_tags.
+
+## Manual testing
+- Automated API tests were removed for this project iteration.
+- Manual QA checklists live in `docs/`.
+- Current auth checklist: `docs/qa-auth-checklist.md`.
+- For each new feature, duplicate and fill: `docs/qa-feature-checklist-template.md`.
 
 
 ## Architecture
@@ -82,17 +89,23 @@ The account screen shows basic profile information and lists events the user has
 - API endpoints:
   - `GET /health` — JSON status/db state.
   - `GET /api/test-db` — DB connectivity test; returns server time.
+  - `POST /api/auth/register` — create account; returns tokens + user.
+  - `POST /api/auth/login` — sign in; returns tokens + user.
+  - `POST /api/auth/refresh` — refresh session; returns new tokens.
+  - `POST /api/auth/logout` — revoke refresh token.
+  - `GET /api/me` — current user profile (requires auth).
+  - `PATCH /api/me` — update profile (requires auth).
   - `GET /api/filters` — list filter options (tags, categories, cities).
   - `GET /api/events` — list events with filters: tag, category, city, date (YYYY-MM-DD), time (HH:MM contained in start/end window), min_rating, q, lat/lng, radius_km, sort (soonest/toprated/price/distance). Returns location summary, tags, rating/price, lat/lng, distance_km for pins.
   - `GET /api/events/:id` — event detail with location, tags, artists, photos, reviews summary/latest, rating/price/time window, ticket_url.
-  - `POST /api/events/:id/reviews` — create a review (rating/comment/photos); updates aggregate rating.
-  - `GET /api/saved` — list saved events for the current user.
-  - `POST /api/saved` — save an event for the current user.
-  - `GET /api/saved/:id` — check if an event is saved.
-  - `DELETE /api/saved/:id` — remove a saved event.
+  - `POST /api/events/:id/reviews` — create a review (rating/comment/photos); updates aggregate rating (requires auth).
+  - `GET /api/saved` — list saved events for the current user (requires auth).
+  - `POST /api/saved` — save an event for the current user (requires auth).
+  - `GET /api/saved/:id` — check if an event is saved (requires auth).
+  - `DELETE /api/saved/:id` — remove a saved event (requires auth).
 
 ## DB schema
-- Core tables: `events` (title, category, start/end, description, cover_image_url, ticket_url, price, rating avg/count, location_id), `locations` (name, address, lat/lng, features, cover image, rating avg/count).
+- Core tables: `users`, `refresh_tokens`, `events` (title, category, start/end, description, cover_image_url, ticket_url, price, rating avg/count, location_id), `locations` (name, address, lat/lng, features, cover image, rating avg/count).
 - Relationships: `event_tags`, `tags`; `event_artists`, `artists`; `event_photos`; `reviews`; `saved_events`.
 - Seed data includes Vienna venues/events, artists, tags, reviews, photos, saved events.
 

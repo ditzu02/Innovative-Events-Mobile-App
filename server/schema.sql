@@ -37,6 +37,32 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 -----------------------------------
+-- USERS TABLE
+-----------------------------------
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    display_name TEXT,
+    avatar_url TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-----------------------------------
+-- REFRESH TOKENS TABLE
+-----------------------------------
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ
+);
+
+-----------------------------------
 -- ARTISTS TABLE
 -----------------------------------
 CREATE TABLE IF NOT EXISTS artists (
@@ -79,7 +105,7 @@ CREATE TABLE IF NOT EXISTS event_tags (
 CREATE TABLE IF NOT EXISTS reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id UUID REFERENCES events(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     rating INTEGER CHECK (rating BETWEEN 1 AND 5),
     comment TEXT,
     photos TEXT[],
@@ -90,7 +116,7 @@ CREATE TABLE IF NOT EXISTS reviews (
 -- SAVED EVENTS (FAVORITES)
 -----------------------------------
 CREATE TABLE IF NOT EXISTS saved_events (
-    user_id UUID NOT NULL,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     event_id UUID REFERENCES events(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (user_id, event_id)

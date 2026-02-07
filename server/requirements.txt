@@ -34,6 +34,8 @@ platformdirs==4.3.6
 prompt_toolkit==3.0.48
 psutil==6.1.0
 psycopg2-binary==2.9.11
+PyJWT==2.9.0
+passlib==1.7.4
 ptyprocess==0.7.0
 pure_eval==0.2.3
 pygame==2.6.1

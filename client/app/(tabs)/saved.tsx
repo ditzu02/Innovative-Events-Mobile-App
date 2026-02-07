@@ -3,7 +3,7 @@ import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "rea
 import { useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
 import { request } from "@/lib/api";
-import { USER_ID } from "@/constants/config";
+import { useAuth } from "@/context/auth";
 
 type Event = {
   id: string;
@@ -37,21 +37,15 @@ const PALETTE = {
 
 export default function SavedScreen() {
   const router = useRouter();
+  const { isAuthed, authLoading } = useAuth();
   const [events, setEvents] = useState<Event[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [removing, setRemoving] = useState<Record<string, boolean>>({});
-  const savedTitle = events ? `Saved Events (${events.length})` : "Saved Events";
+  const savedTitle = events && isAuthed ? `Saved Events (${events.length})` : "Saved Events";
 
   const fetchSaved = useCallback(async () => {
-    if (!USER_ID) {
-      setError("Set EXPO_PUBLIC_USER_ID to enable saved events.");
-      setEvents([]);
-      setLoading(false);
-      return;
-    }
-
     setLoading(true);
     try {
       const data = await request<{ events: Event[] }>("/api/saved", { timeoutMs: 12000 });
@@ -63,7 +57,7 @@ export default function SavedScreen() {
     } finally {
       setLoading(false);
     }
-  }, [USER_ID, request]);
+  }, [request]);
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
@@ -75,8 +69,17 @@ export default function SavedScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      fetchSaved();
-    }, [fetchSaved])
+      if (authLoading) {
+        return;
+      }
+      if (isAuthed) {
+        fetchSaved();
+      } else {
+        setLoading(false);
+        setEvents([]);
+        setError(null);
+      }
+    }, [fetchSaved, isAuthed, authLoading])
   );
 
   const handleRemove = useCallback(async (eventId: string) => {
@@ -100,7 +103,19 @@ export default function SavedScreen() {
     <View style={styles.container}>
       <Text style={styles.title}>{savedTitle}</Text>
 
-      {loading && events === null && (
+      {!authLoading && !isAuthed && (
+        <View style={styles.emptyState}>
+          <Text style={styles.emptyTitle}>Sign in to see saved events.</Text>
+          <Text style={styles.emptySubtitle}>
+            Create an account to save events and keep them here.
+          </Text>
+          <Pressable style={styles.emptyButton} onPress={() => router.push("/account")}>
+            <Text style={styles.emptyButtonText}>Go to Account</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {isAuthed && loading && events === null && (
         <View style={styles.skeletonList}>
           {[0, 1, 2].map((item) => (
             <View key={item} style={styles.skeletonCard}>
@@ -117,9 +132,9 @@ export default function SavedScreen() {
         </View>
       )}
 
-      {!loading && error && <Text style={styles.error}>Error: {error}</Text>}
+      {!loading && isAuthed && error && <Text style={styles.error}>Error: {error}</Text>}
 
-      {!loading && !error && events && events.length === 0 && (
+      {!loading && isAuthed && !error && events && events.length === 0 && (
         <View style={styles.emptyState}>
           <Text style={styles.emptyTitle}>No saved events yet.</Text>
           <Text style={styles.emptySubtitle}>
@@ -131,7 +146,7 @@ export default function SavedScreen() {
         </View>
       )}
 
-      {events && events.length > 0 && (
+      {isAuthed && events && events.length > 0 && (
         <FlatList
           data={events}
           keyExtractor={(item) => item.id}

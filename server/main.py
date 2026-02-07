@@ -1,17 +1,21 @@
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
+import hashlib
 import logging
 import os
 from pathlib import Path
 from decimal import Decimal
 import math
+import secrets
 import uuid
 
 import psycopg2
-from psycopg2 import OperationalError, InterfaceError
+from psycopg2 import OperationalError, InterfaceError, IntegrityError
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 from psycopg2.pool import SimpleConnectionPool, PoolError
+import jwt
+from passlib.context import CryptContext
 
 app = Flask(__name__)
 CORS(app)
@@ -47,6 +51,19 @@ if missing_env:
     raise RuntimeError(f"Missing required environment variables: {missing_list}")
 
 logger.info("Loaded database configuration for host=%s port=%s db=%s", DB_HOST, DB_PORT, DB_NAME)
+
+JWT_SECRET = os.getenv("JWT_SECRET")
+ACCESS_TOKEN_TTL_MIN = int(os.getenv("ACCESS_TOKEN_TTL_MIN", "15"))
+REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
+
+if not JWT_SECRET:
+    logger.warning("JWT_SECRET is not set. Auth endpoints will not work until it is configured.")
+
+pwd_context = CryptContext(
+    schemes=["pbkdf2_sha256", "bcrypt"],
+    default="pbkdf2_sha256",
+    deprecated="auto",
+)
 
 db_pool: SimpleConnectionPool | None = None
 
@@ -142,13 +159,88 @@ def execute_with_retry(query: str, params: tuple = ()) -> tuple:
         raise
 
 
-def get_user_id() -> str | None:
-    """Extract user id from request headers or query params."""
-    user_id = request.headers.get("X-User-Id") or request.args.get("user_id")
+def require_jwt_secret() -> None:
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET is not set")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        logger.exception("Password verification failed")
+        return False
+
+
+def create_access_token(user_id: str) -> str:
+    require_jwt_secret()
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "type": "access",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=ACCESS_TOKEN_TTL_MIN)).timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def decode_access_token(token: str) -> dict:
+    require_jwt_secret()
+    payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    if payload.get("type") != "access":
+        raise jwt.InvalidTokenError("Invalid token type")
+    return payload
+
+
+def hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_refresh_token(user_id: str, cursor) -> str:
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = hash_refresh_token(raw_token)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=REFRESH_TOKEN_TTL_DAYS)
+    cursor.execute(
+        """
+        INSERT INTO refresh_tokens (user_id, token_hash, created_at, expires_at)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (user_id, token_hash, now, expires_at),
+    )
+    return raw_token
+
+
+def get_auth_user_id():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header:
+        return None, (jsonify({"error": "Missing authorization"}), 401)
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None, (jsonify({"error": "Invalid authorization header"}), 401)
+    token = parts[1].strip()
+    if not token:
+        return None, (jsonify({"error": "Invalid authorization header"}), 401)
+    try:
+        payload = decode_access_token(token)
+    except RuntimeError as exc:
+        return None, (jsonify({"error": str(exc)}), 500)
+    except jwt.ExpiredSignatureError:
+        return None, (jsonify({"error": "Token expired"}), 401)
+    except jwt.InvalidTokenError:
+        return None, (jsonify({"error": "Invalid token"}), 401)
+    user_id = payload.get("sub")
     if not user_id:
-        return None
-    user_id = user_id.strip()
-    return user_id or None
+        return None, (jsonify({"error": "Invalid token"}), 401)
+    try:
+        uuid.UUID(user_id)
+    except ValueError:
+        return None, (jsonify({"error": "Invalid token"}), 401)
+    return user_id, None
 
 
 def extract_city(address: str | None) -> str | None:
@@ -160,6 +252,19 @@ def extract_city(address: str | None) -> str | None:
     if len(parts) >= 2:
         return parts[-2]
     return parts[0]
+
+
+def user_row_to_dict(row) -> dict:
+    if not row:
+        return {}
+    user_id, email, display_name, avatar_url, created_at = row
+    return {
+        "id": str(user_id),
+        "email": email,
+        "display_name": display_name,
+        "avatar_url": avatar_url,
+        "created_at": created_at.isoformat() if created_at else None,
+    }
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -223,6 +328,286 @@ def test_db():
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email") or "").strip().lower()
+    password = str(payload.get("password") or "")
+    display_name = payload.get("display_name")
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email is required"}), 400
+    if not password or len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    display_name = str(display_name).strip() if display_name is not None else None
+    if display_name == "":
+        display_name = None
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        password_hash = hash_password(password)
+        cursor.execute(
+            """
+            INSERT INTO users (email, password_hash, display_name)
+            VALUES (%s, %s, %s)
+            RETURNING id, email, display_name, avatar_url, created_at
+            """,
+            (email, password_hash, display_name),
+        )
+        user_row = cursor.fetchone()
+        refresh_token = create_refresh_token(str(user_row[0]), cursor)
+        access_token = create_access_token(str(user_row[0]))
+        connection.commit()
+        return jsonify(
+            {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "user": user_row_to_dict(user_row),
+            }
+        )
+    except IntegrityError:
+        if connection:
+            connection.rollback()
+        return jsonify({"error": "Email already in use"}), 409
+    except RuntimeError as exc:
+        if connection:
+            connection.rollback()
+        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        if connection:
+            connection.rollback()
+        logger.exception("Registration failed")
+        return jsonify({"error": "Unable to register"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email") or "").strip().lower()
+    password = str(payload.get("password") or "")
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, email, password_hash, display_name, avatar_url, created_at
+            FROM users
+            WHERE email = %s
+            """,
+            (email,),
+        )
+        row = cursor.fetchone()
+        if not row or not verify_password(password, row[2]):
+            return jsonify({"error": "Invalid email or password"}), 401
+        user_row = (row[0], row[1], row[3], row[4], row[5])
+        refresh_token = create_refresh_token(str(row[0]), cursor)
+        access_token = create_access_token(str(row[0]))
+        connection.commit()
+        return jsonify(
+            {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "user": user_row_to_dict(user_row),
+            }
+        )
+    except RuntimeError as exc:
+        if connection:
+            connection.rollback()
+        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        if connection:
+            connection.rollback()
+        logger.exception("Login failed")
+        return jsonify({"error": "Unable to login"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def refresh():
+    payload = request.get_json(silent=True) or {}
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    if not refresh_token:
+        return jsonify({"error": "refresh_token is required"}), 400
+
+    connection = None
+    cursor = None
+    now = datetime.now(timezone.utc)
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        token_hash = hash_refresh_token(refresh_token)
+        cursor.execute(
+            """
+            SELECT id, user_id, expires_at, revoked_at
+            FROM refresh_tokens
+            WHERE token_hash = %s
+            """,
+            (token_hash,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"error": "Invalid refresh token"}), 401
+        token_id, user_id, expires_at, revoked_at = row
+        if revoked_at is not None or (expires_at and expires_at < now):
+            return jsonify({"error": "Refresh token expired"}), 401
+        cursor.execute(
+            """
+            UPDATE refresh_tokens
+            SET revoked_at = %s, last_used_at = %s
+            WHERE id = %s
+            """,
+            (now, now, token_id),
+        )
+        new_refresh_token = create_refresh_token(str(user_id), cursor)
+        access_token = create_access_token(str(user_id))
+        connection.commit()
+        return jsonify({"access_token": access_token, "refresh_token": new_refresh_token})
+    except RuntimeError as exc:
+        if connection:
+            connection.rollback()
+        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        if connection:
+            connection.rollback()
+        logger.exception("Token refresh failed")
+        return jsonify({"error": "Unable to refresh session"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    payload = request.get_json(silent=True) or {}
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    if not refresh_token:
+        return jsonify({"error": "refresh_token is required"}), 400
+
+    connection = None
+    cursor = None
+    now = datetime.now(timezone.utc)
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        token_hash = hash_refresh_token(refresh_token)
+        cursor.execute(
+            """
+            UPDATE refresh_tokens
+            SET revoked_at = %s, last_used_at = %s
+            WHERE token_hash = %s AND revoked_at IS NULL
+            """,
+            (now, now, token_hash),
+        )
+        connection.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        if connection:
+            connection.rollback()
+        logger.exception("Logout failed")
+        return jsonify({"error": "Unable to logout"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/me", methods=["GET", "PATCH"])
+def me():
+    user_id, error_response = get_auth_user_id()
+    if error_response:
+        return error_response
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, email, display_name, avatar_url, created_at, password_hash
+            FROM users
+            WHERE id = %s
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"error": "User not found"}), 404
+
+        if request.method == "GET":
+            user_row = (row[0], row[1], row[2], row[3], row[4])
+            return jsonify({"user": user_row_to_dict(user_row)})
+
+        payload = request.get_json(silent=True) or {}
+        display_name = payload.get("display_name")
+        avatar_url = payload.get("avatar_url")
+        password_current = payload.get("password_current")
+        password_new = payload.get("password_new")
+
+        updates = []
+        params = []
+
+        if display_name is not None:
+            display_name = str(display_name).strip()
+            updates.append("display_name = %s")
+            params.append(display_name or None)
+        if avatar_url is not None:
+            avatar_url = str(avatar_url).strip()
+            updates.append("avatar_url = %s")
+            params.append(avatar_url or None)
+
+        if password_new:
+            if not password_current:
+                return jsonify({"error": "password_current is required"}), 400
+            if not verify_password(str(password_current), row[5]):
+                return jsonify({"error": "Current password is incorrect"}), 400
+            if len(str(password_new)) < 6:
+                return jsonify({"error": "password_new must be at least 6 characters"}), 400
+            new_hash = hash_password(str(password_new))
+            updates.append("password_hash = %s")
+            params.append(new_hash)
+
+        if not updates:
+            return jsonify({"error": "No updates provided"}), 400
+
+        updates.append("updated_at = NOW()")
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = %s RETURNING id, email, display_name, avatar_url, created_at"
+        params.append(user_id)
+        cursor.execute(query, params)
+        updated_row = cursor.fetchone()
+        connection.commit()
+        return jsonify({"user": user_row_to_dict(updated_row)})
+    except Exception:
+        if connection:
+            connection.rollback()
+        logger.exception("User profile update failed")
+        return jsonify({"error": "Unable to update profile"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
 
 @app.route("/api/filters")
 def list_filters():
@@ -564,9 +949,9 @@ def list_events():
 def saved_events():
     connection = None
     cursor = None
-    user_id = get_user_id()
-    if not user_id:
-        return jsonify({"error": "Missing user id"}), 400
+    user_id, error_response = get_auth_user_id()
+    if error_response:
+        return error_response
     try:
         if request.method == "POST":
             payload = request.get_json(silent=True) or {}
@@ -715,9 +1100,9 @@ def saved_events():
 def saved_event(event_id: str):
     connection = None
     cursor = None
-    user_id = get_user_id()
-    if not user_id:
-        return jsonify({"error": "Missing user id"}), 400
+    user_id, error_response = get_auth_user_id()
+    if error_response:
+        return error_response
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
@@ -749,9 +1134,9 @@ def saved_event(event_id: str):
 def create_review(event_id: str):
     connection = None
     cursor = None
-    user_id = get_user_id()
-    if not user_id:
-        return jsonify({"error": "Missing user id"}), 400
+    user_id, error_response = get_auth_user_id()
+    if error_response:
+        return error_response
     try:
         uuid.UUID(user_id)
     except ValueError:

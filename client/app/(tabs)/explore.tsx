@@ -46,6 +46,14 @@ const PALETTE = {
 };
 const USER_PIN_COLOR = PALETTE.accent;
 
+function toDiscoverErrorMessage(err: unknown) {
+  const message = err instanceof Error ? err.message : "Unknown error";
+  if (message === "Request timed out") {
+    return "Cannot reach the server. Check EXPO_PUBLIC_API_URL and make sure the backend is running.";
+  }
+  return message;
+}
+
 export default function DiscoverScreen() {
   const [events, setEvents] = useState<Event[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -209,7 +217,7 @@ export default function DiscoverScreen() {
         setAvailableCities(data.cities?.length ? data.cities : FALLBACK_CITIES);
         setFiltersError(null);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Unable to load filters";
+        const message = toDiscoverErrorMessage(err);
         if (!cancelled) {
           setFiltersError(message);
         }
@@ -291,7 +299,7 @@ export default function DiscoverScreen() {
         setEvents(data.events ?? []);
         setError(null);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Unknown error";
+        const message = toDiscoverErrorMessage(err);
         setError(message);
         console.error("Discover fetch error", message);
       } finally {

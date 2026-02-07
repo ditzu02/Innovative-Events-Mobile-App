@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 import psycopg2
 from psycopg2.extras import Json
+from passlib.context import CryptContext
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +23,16 @@ DB_NAME = os.getenv("DB_NAME")
 REQUIRED_ENV_VARS = (DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME)
 if not all(REQUIRED_ENV_VARS):
   raise RuntimeError("Missing one or more DB env vars (DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME)")
+
+DEMO_USER_EMAIL = os.getenv("DEMO_USER_EMAIL")
+DEMO_USER_PASSWORD = os.getenv("DEMO_USER_PASSWORD")
+DEMO_USER_DISPLAY_NAME = os.getenv("DEMO_USER_DISPLAY_NAME")
+
+pwd_context = CryptContext(
+  schemes=["pbkdf2_sha256", "bcrypt"],
+  default="pbkdf2_sha256",
+  deprecated="auto",
+)
 
 
 def get_conn():
@@ -80,6 +91,23 @@ def get_or_create_tag(cur, name: str):
       return inserted[0]
   # If conflict, fetch again
   cur.execute("SELECT id FROM tags WHERE name = %s", (name,))
+  return cur.fetchone()[0]
+
+
+def get_or_create_user(cur, email: str, password: str, display_name: str | None = None):
+  cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+  row = cur.fetchone()
+  if row:
+      return row[0]
+  password_hash = pwd_context.hash(password)
+  cur.execute(
+      """
+      INSERT INTO users (email, password_hash, display_name)
+      VALUES (%s, %s, %s)
+      RETURNING id;
+      """,
+      (email, password_hash, display_name),
+  )
   return cur.fetchone()[0]
 
 
@@ -232,6 +260,15 @@ def main():
 
       logger.info("Seeding tags...")
       tag_ids = {name: get_or_create_tag(cur, name) for name in tags}
+
+      if DEMO_USER_EMAIL and DEMO_USER_PASSWORD:
+          logger.info("Seeding demo user...")
+          get_or_create_user(
+              cur,
+              DEMO_USER_EMAIL.strip().lower(),
+              DEMO_USER_PASSWORD,
+              DEMO_USER_DISPLAY_NAME,
+          )
 
       logger.info("Seeding events and event_tags...")
       for ev in events:

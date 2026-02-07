@@ -16,7 +16,7 @@ import {
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { useHeaderHeight } from "@react-navigation/elements";
 import { request } from "@/lib/api";
-import { USER_ID } from "@/constants/config";
+import { useAuth } from "@/context/auth";
 
 type EventDetail = {
   id: string;
@@ -69,6 +69,7 @@ export default function EventDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const headerHeight = useHeaderHeight();
+  const { isAuthed } = useAuth();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -78,8 +79,8 @@ export default function EventDetailScreen() {
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const saveNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const canSave = Boolean(USER_ID);
-  const canReview = Boolean(USER_ID);
+  const canSave = isAuthed;
+  const canReview = isAuthed;
   const [showReviewForm, setShowReviewForm] = useState(false);
   const [reviewRating, setReviewRating] = useState<number | null>(null);
   const [reviewComment, setReviewComment] = useState("");
@@ -151,7 +152,11 @@ export default function EventDetailScreen() {
   }, [pendingReviewScroll, scrollToY]);
 
   useEffect(() => {
-    if (!id || !canSave) return;
+    if (!id || !canSave) {
+      setSaved(false);
+      setSaveError(null);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -173,7 +178,12 @@ export default function EventDetailScreen() {
   }, [id, canSave, request]);
 
   const handleToggleSave = async () => {
-    if (!id || !canSave || saveLoading) return;
+    if (!id || saveLoading) return;
+    if (!canSave) {
+      showSaveNotice("Sign in to save events.");
+      router.push("/account");
+      return;
+    }
     setSaveLoading(true);
     try {
       if (saved) {
@@ -258,7 +268,8 @@ export default function EventDetailScreen() {
   const handleSubmitReview = async () => {
     if (!id) return;
     if (!canReview) {
-      setReviewError("Set EXPO_PUBLIC_USER_ID to submit reviews.");
+      setReviewError("Sign in to submit reviews.");
+      router.push("/account");
       return;
     }
     if (!reviewRating) {
@@ -388,15 +399,21 @@ export default function EventDetailScreen() {
               </Pressable>
               <Pressable
                 onPress={handleToggleSave}
-                disabled={!canSave || saveLoading}
+                disabled={saveLoading}
                 style={({ pressed }) => [
                   styles.secondaryButton,
                   (!canSave || saveLoading) && styles.secondaryButtonDisabled,
-                  pressed && canSave && !saveLoading && { opacity: 0.9 },
+                  pressed && !saveLoading && { opacity: 0.9 },
                 ]}
               >
                 <Text style={styles.secondaryButtonText}>
-                  {saveLoading ? "Saving..." : saved ? "Saved" : "Save"}
+                  {saveLoading
+                    ? "Saving..."
+                    : !canSave
+                      ? "Sign in to save"
+                      : saved
+                        ? "Saved"
+                        : "Save"}
                 </Text>
               </Pressable>
             </View>
@@ -528,13 +545,21 @@ export default function EventDetailScreen() {
               <Text style={styles.sectionTitle}>Write a Review</Text>
               {!canReview && (
                 <View style={styles.notice}>
-                  <Text style={styles.noticeText}>
-                    Set EXPO_PUBLIC_USER_ID in your client env to submit reviews.
-                  </Text>
+                  <Text style={styles.noticeText}>Sign in to write a review.</Text>
+                  <Pressable
+                    onPress={() => router.push("/account")}
+                    style={({ pressed }) => [styles.noticeButton, pressed && { opacity: 0.8 }]}
+                  >
+                    <Text style={styles.noticeButtonText}>Go to Account</Text>
+                  </Pressable>
                 </View>
               )}
               <Pressable
                 onPress={() => {
+                  if (!canReview) {
+                    router.push("/account");
+                    return;
+                  }
                   setShowReviewForm((prev) => {
                     const next = !prev;
                     if (next) {
@@ -545,10 +570,9 @@ export default function EventDetailScreen() {
                   setReviewError(null);
                   setReviewSuccess(null);
                 }}
-                disabled={!canReview}
                 style={({ pressed }) => [
                   styles.reviewToggle,
-                  (!canReview || pressed) && { opacity: 0.7 },
+                  (pressed || !canReview) && { opacity: 0.7 },
                 ]}
               >
                 <Text style={styles.reviewToggleText}>
@@ -770,10 +794,12 @@ const styles = StyleSheet.create({
   },
   primaryButtonText: { color: "#fff", fontWeight: "700", fontSize: 14 },
   secondaryButton: {
-    width: 90,
+    minWidth: 132,
     borderRadius: 12,
     paddingVertical: 12,
+    paddingHorizontal: 12,
     alignItems: "center",
+    justifyContent: "center",
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: PALETTE.accent,
     backgroundColor: PALETTE.surfaceAlt,
@@ -781,7 +807,7 @@ const styles = StyleSheet.create({
   secondaryButtonDisabled: {
     opacity: 0.6,
   },
-  secondaryButtonText: { color: PALETTE.accent, fontWeight: "700", fontSize: 14 },
+  secondaryButtonText: { color: PALETTE.accent, fontWeight: "700", fontSize: 14, textAlign: "center" },
   secondaryActionRow: { flexDirection: "row", gap: 10 },
   tertiaryButton: {
     flex: 1,
@@ -817,8 +843,19 @@ const styles = StyleSheet.create({
     backgroundColor: PALETTE.surfaceAlt,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: PALETTE.line,
+    gap: 8,
   },
   noticeText: { color: PALETTE.muted, fontSize: 12 },
+  noticeButton: {
+    alignSelf: "flex-start",
+    backgroundColor: PALETTE.accentSoft,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.accent,
+  },
+  noticeButtonText: { color: PALETTE.text, fontSize: 12, fontWeight: "600" },
   feedback: {
     padding: 10,
     borderRadius: 10,
