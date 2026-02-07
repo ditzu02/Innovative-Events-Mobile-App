@@ -4,6 +4,7 @@ import { useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
 import { request } from "@/lib/api";
 import { useAuth } from "@/context/auth";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 type Event = {
   id: string;
@@ -100,7 +101,7 @@ export default function SavedScreen() {
   }, [request]);
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={styles.container} edges={["top"]}>
       <Text style={styles.title}>{savedTitle}</Text>
 
       {!authLoading && !isAuthed && (
@@ -212,7 +213,7 @@ export default function SavedScreen() {
           )}
         />
       )}
-    </View>
+    </SafeAreaView>
   );
 }
 

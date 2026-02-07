@@ -5,6 +5,7 @@ import Slider from "@react-native-community/slider";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import { useRouter } from "expo-router";
 import { request } from "@/lib/api";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 type Event = {
   id: string;
@@ -322,18 +323,19 @@ export default function DiscoverScreen() {
   }, [fetchEvents]);
 
   return (
-    <ScrollView
-      style={styles.screen}
-      contentContainerStyle={styles.container}
-      refreshControl={(
-        <RefreshControl
-          refreshing={refreshing}
-          onRefresh={handleRefresh}
-          tintColor={PALETTE.accent}
-          colors={[PALETTE.accent]}
-        />
-      )}
-    >
+    <SafeAreaView style={styles.screen} edges={["top"]}>
+      <ScrollView
+        style={styles.screen}
+        contentContainerStyle={styles.container}
+        refreshControl={(
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            tintColor={PALETTE.accent}
+            colors={[PALETTE.accent]}
+          />
+        )}
+      >
       <Text style={styles.title}>Discover</Text>
       <Text style={styles.subtitle}>Filters → map preview → list. Expand map to browse pins.</Text>
 
@@ -792,7 +794,8 @@ export default function DiscoverScreen() {
           )}
         </View>
       </Modal>
-    </ScrollView>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 

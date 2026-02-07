@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useAuth } from "@/context/auth";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 const PALETTE = {
   background: "#0b0a12",
@@ -90,16 +91,17 @@ export default function AccountScreen() {
 
   if (authLoading) {
     return (
-      <View style={styles.container}>
+      <SafeAreaView style={styles.container} edges={["top"]}>
         <Text style={styles.title}>Account</Text>
         <Text style={styles.muted}>Loading…</Text>
-      </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Text style={styles.title}>Account</Text>
+    <SafeAreaView style={styles.container} edges={["top"]}>
+      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+        <Text style={styles.title}>Account</Text>
 
       {!isAuthed && (
         <View style={styles.card}>
@@ -162,8 +164,8 @@ export default function AccountScreen() {
         </View>
       )}
 
-      {isAuthed && user && (
-        <View style={styles.card}>
+        {isAuthed && user && (
+          <View style={styles.card}>
           <Text style={styles.sectionTitle}>Signed in</Text>
           <Text style={styles.body}>{user.display_name || "Unnamed user"}</Text>
           <Text style={styles.muted}>{user.email}</Text>
@@ -223,9 +225,10 @@ export default function AccountScreen() {
           >
             <Text style={styles.secondaryButtonText}>Sign out</Text>
           </Pressable>
-        </View>
-      )}
-    </ScrollView>
+          </View>
+        )}
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
