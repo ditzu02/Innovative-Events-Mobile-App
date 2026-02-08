@@ -19,6 +19,7 @@ import MapView, { Callout, Marker, PROVIDER_GOOGLE, Region } from "react-native-
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { CategoryRail, RailCategoryKey, RailChip } from "@/components/CategoryRail";
 import { EventCard, EventCardViewModel } from "@/components/EventCard";
 import {
   applyClientSideFilters,
@@ -112,6 +113,17 @@ const PALETTE = {
   danger: "#ff6b6b",
 };
 const USER_PIN_COLOR = PALETTE.accent;
+const RAIL_CATEGORY_CONFIG: {
+  key: Exclude<RailCategoryKey, "all">;
+  label: string;
+  aliases: string[];
+}[] = [
+  { key: "music", label: "Music", aliases: ["music"] },
+  { key: "food", label: "Food", aliases: ["food", "food-drink"] },
+  { key: "nightlife", label: "Nightlife", aliases: ["nightlife"] },
+  { key: "arts", label: "Arts", aliases: ["arts", "arts-culture"] },
+  { key: "outdoor", label: "Outdoor", aliases: ["outdoor"] },
+];
 
 function slugifyLabel(value: string) {
   return value
@@ -194,6 +206,23 @@ function getStatusLabel(
   return null;
 }
 
+type CoordinateLike = {
+  latitude?: number | null;
+  longitude?: number | null;
+};
+
+function hasValidCoordinate<T extends CoordinateLike>(
+  coordinate: T | null | undefined
+): coordinate is T & { latitude: number; longitude: number } {
+  if (!coordinate) return false;
+  const { latitude, longitude } = coordinate;
+  if (latitude == null || longitude == null) return false;
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return false;
+  if (latitude < -90 || latitude > 90) return false;
+  if (longitude < -180 || longitude > 180) return false;
+  return true;
+}
+
 export default function DiscoverScreen() {
   const router = useRouter();
 
@@ -230,11 +259,17 @@ export default function DiscoverScreen() {
 
   const [isUsingCachedResults, setIsUsingCachedResults] = useState(false);
   const [cachedIndicator, setCachedIndicator] = useState<string | null>(null);
+  const [selectedRailCategory, setSelectedRailCategory] = useState<RailCategoryKey>("all");
+  const [railNotice, setRailNotice] = useState<string | null>(null);
   const [clockTick, setClockTick] = useState<number>(() => Date.now());
 
   const mapRef = useRef<MapView | null>(null);
   const mapRegionRef = useRef<Region>(DEFAULT_REGION);
   const hasAutoCenteredRef = useRef(false);
+  const selectedRailCategoryRef = useRef<RailCategoryKey>("all");
+  const fetchSeqRef = useRef(0);
+  const activeFetchSeqRef = useRef(0);
+  const eventsAbortRef = useRef<AbortController | null>(null);
   const lastSuccessfulEventsRef = useRef<Event[] | null>(null);
 
   const taxonomyEnabled = !!taxonomyCategories?.length;
@@ -272,6 +307,46 @@ export default function DiscoverScreen() {
     availableTags.forEach((item) => map.set(item.id, item));
     return map;
   }, [availableTags]);
+
+  const railChips = useMemo<RailChip[]>(() => {
+    const categoriesBySlug = new Map<string, TaxonomyNode>();
+    availableCategories.forEach((category) => {
+      const normalizedSlug = category.slug.trim().toLowerCase();
+      if (normalizedSlug && !categoriesBySlug.has(normalizedSlug)) {
+        categoriesBySlug.set(normalizedSlug, category);
+      }
+    });
+
+    const fixedChips: RailChip[] = RAIL_CATEGORY_CONFIG.map((definition) => {
+      const resolved =
+        definition.aliases
+          .map((alias) => categoriesBySlug.get(alias))
+          .find(Boolean) ?? null;
+
+      return {
+        key: definition.key,
+        label: definition.label,
+        categoryId: resolved?.id ?? null,
+        slug: resolved?.slug ?? null,
+        disabled: resolved == null,
+      };
+    });
+
+    return [
+      { key: "all", label: "All", categoryId: null, slug: null },
+      ...fixedChips,
+    ];
+  }, [availableCategories]);
+
+  const railCategoryById = useMemo(() => {
+    const map = new Map<string, RailCategoryKey>();
+    railChips.forEach((chip) => {
+      if (chip.categoryId) {
+        map.set(chip.categoryId, chip.key);
+      }
+    });
+    return map;
+  }, [railChips]);
 
   const draftSelectedCategoryTree = useMemo(
     () => taxonomyCategories?.find((item) => item.id === draftFilters.categoryId) ?? null,
@@ -354,12 +429,14 @@ export default function DiscoverScreen() {
 
   const activeFilterCount = useMemo(() => getActiveFilterCount(appliedFilters), [appliedFilters]);
 
-  const locationLabel = userLocation
+  const hasValidUserLocation = hasValidCoordinate(userLocation);
+
+  const locationLabel = hasValidUserLocation
     ? `${userLocation.latitude.toFixed(4)}, ${userLocation.longitude.toFixed(4)}`
     : "Pin not set";
 
   const getPreviewRegion = useCallback(() => {
-    if (userLocation) {
+    if (hasValidUserLocation && userLocation) {
       return {
         latitude: userLocation.latitude,
         longitude: userLocation.longitude,
@@ -369,8 +446,8 @@ export default function DiscoverScreen() {
     }
 
     const markerSource = discoverEvents.length > 0 ? discoverEvents : [];
-    const firstWithCoords = markerSource.find((event) => event.latitude != null && event.longitude != null);
-    if (firstWithCoords?.latitude != null && firstWithCoords.longitude != null) {
+    const firstWithCoords = markerSource.find((event) => hasValidCoordinate(event));
+    if (firstWithCoords) {
       const current = mapRegionRef.current ?? DEFAULT_REGION;
       return {
         latitude: firstWithCoords.latitude,
@@ -381,11 +458,11 @@ export default function DiscoverScreen() {
     }
 
     return mapRegionRef.current ?? DEFAULT_REGION;
-  }, [userLocation, discoverEvents]);
+  }, [userLocation, hasValidUserLocation, discoverEvents]);
 
   const getTargetRegion = useCallback(() => {
     const current = mapRegionRef.current ?? DEFAULT_REGION;
-    if (userLocation) {
+    if (hasValidUserLocation && userLocation) {
       return {
         latitude: userLocation.latitude,
         longitude: userLocation.longitude,
@@ -394,10 +471,14 @@ export default function DiscoverScreen() {
       };
     }
     return current;
-  }, [userLocation]);
+  }, [userLocation, hasValidUserLocation]);
 
   const handleDropPin = useCallback(
     (coordinate: { latitude: number; longitude: number }) => {
+      if (!hasValidCoordinate(coordinate)) {
+        return;
+      }
+
       const nextRegion = {
         latitude: coordinate.latitude,
         longitude: coordinate.longitude,
@@ -417,19 +498,31 @@ export default function DiscoverScreen() {
   const visibleEvents = useMemo(() => {
     if (!mapRegion) return discoverEvents;
     const { latitude, longitude, latitudeDelta, longitudeDelta } = mapRegion;
+    if (
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      !Number.isFinite(latitudeDelta) ||
+      !Number.isFinite(longitudeDelta)
+    ) {
+      return discoverEvents.filter((event) => hasValidCoordinate(event));
+    }
     const minLat = latitude - latitudeDelta / 2;
     const maxLat = latitude + latitudeDelta / 2;
     const minLng = longitude - longitudeDelta / 2;
     const maxLng = longitude + longitudeDelta / 2;
 
     return discoverEvents.filter(
-      (event) =>
-        event.latitude != null &&
-        event.longitude != null &&
-        event.latitude >= minLat &&
-        event.latitude <= maxLat &&
-        event.longitude >= minLng &&
-        event.longitude <= maxLng
+      (event) => {
+        if (!hasValidCoordinate(event)) {
+          return false;
+        }
+        return (
+          event.latitude >= minLat &&
+          event.latitude <= maxLat &&
+          event.longitude >= minLng &&
+          event.longitude <= maxLng
+        );
+      }
     );
   }, [mapRegion, discoverEvents]);
 
@@ -445,6 +538,60 @@ export default function DiscoverScreen() {
     setAdvancedExpanded(false);
     setFilterSheetVisible(true);
   }, [appliedFilters]);
+
+  const handleSelectRailChip = useCallback((chip: RailChip) => {
+    if (chip.disabled) {
+      setRailNotice("Category unavailable");
+      return;
+    }
+
+    const nextCategoryId = chip.key === "all" ? null : chip.categoryId;
+    if (chip.key !== "all" && !nextCategoryId) {
+      setRailNotice("Category unavailable");
+      return;
+    }
+
+    const appliedAligned =
+      appliedFilters.categoryId === nextCategoryId &&
+      appliedFilters.subcategoryId == null &&
+      appliedFilters.tagId == null;
+    const draftAligned =
+      draftFilters.categoryId === nextCategoryId &&
+      draftFilters.subcategoryId == null &&
+      draftFilters.tagId == null;
+    if (selectedRailCategory === chip.key && appliedAligned && draftAligned) {
+      return;
+    }
+
+    setRailNotice(null);
+    setSelectedRailCategory(chip.key);
+
+    if (!appliedAligned) {
+      setAppliedFilters((prev) => ({
+        ...prev,
+        categoryId: nextCategoryId,
+        subcategoryId: null,
+        tagId: null,
+      }));
+    }
+
+    if (!draftAligned) {
+      setDraftFilters((prev) => ({
+        ...prev,
+        categoryId: nextCategoryId,
+        subcategoryId: null,
+        tagId: null,
+      }));
+    }
+  }, [
+    appliedFilters.categoryId,
+    appliedFilters.subcategoryId,
+    appliedFilters.tagId,
+    draftFilters.categoryId,
+    draftFilters.subcategoryId,
+    draftFilters.tagId,
+    selectedRailCategory,
+  ]);
 
   const handleCancelFilters = useCallback(() => {
     setDraftFilters((_) => cloneFilters(appliedFilters));
@@ -520,6 +667,39 @@ export default function DiscoverScreen() {
   }, []);
 
   useEffect(() => {
+    if (!railNotice) return;
+    const timer = setTimeout(() => setRailNotice(null), 2600);
+    return () => clearTimeout(timer);
+  }, [railNotice]);
+
+  useEffect(() => {
+    if (!appliedFilters.categoryId) {
+      setSelectedRailCategory((prev) => (prev === "all" ? prev : "all"));
+      return;
+    }
+
+    const matchedRailCategory = railCategoryById.get(appliedFilters.categoryId);
+    if (matchedRailCategory) {
+      setSelectedRailCategory((prev) => (prev === matchedRailCategory ? prev : matchedRailCategory));
+      return;
+    }
+
+    setSelectedRailCategory((prev) => (prev === "all" ? prev : "all"));
+  }, [appliedFilters.categoryId, railCategoryById]);
+
+  useEffect(() => {
+    selectedRailCategoryRef.current = selectedRailCategory;
+  }, [selectedRailCategory]);
+
+  useEffect(() => {
+    return () => {
+      activeFetchSeqRef.current = fetchSeqRef.current + 1;
+      eventsAbortRef.current?.abort();
+      eventsAbortRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     mapRegionRef.current = mapRegion;
   }, [mapRegion]);
 
@@ -552,11 +732,11 @@ export default function DiscoverScreen() {
 
   useEffect(() => {
     if (hasAutoCenteredRef.current) return;
-    if (userLocation) return;
+    if (hasValidUserLocation) return;
     if (!discoverEvents.length) return;
 
-    const firstWithCoords = discoverEvents.find((event) => event.latitude != null && event.longitude != null);
-    if (firstWithCoords?.latitude == null || firstWithCoords.longitude == null) {
+    const firstWithCoords = discoverEvents.find((event) => hasValidCoordinate(event));
+    if (!firstWithCoords) {
       return;
     }
 
@@ -571,7 +751,7 @@ export default function DiscoverScreen() {
     };
 
     setMapRegion(nextRegion);
-  }, [discoverEvents, userLocation]);
+  }, [discoverEvents, hasValidUserLocation]);
 
   const sanitizeFilters = useCallback(
     (filters: DiscoverFilters): DiscoverFilters => {
@@ -644,6 +824,17 @@ export default function DiscoverScreen() {
   }, []);
 
   const fetchEvents = useCallback(async () => {
+    const seq = fetchSeqRef.current + 1;
+    fetchSeqRef.current = seq;
+    activeFetchSeqRef.current = seq;
+
+    eventsAbortRef.current?.abort();
+    const abortController = new AbortController();
+    eventsAbortRef.current = abortController;
+
+    const railAtStart = selectedRailCategoryRef.current;
+    const isActiveRequest = () => activeFetchSeqRef.current === seq;
+
     setLoading(true);
 
     try {
@@ -658,18 +849,54 @@ export default function DiscoverScreen() {
       if (trimmedSearch) searchParams.append("q", trimmedSearch);
       searchParams.append("sort", "soonest");
 
-      if (userLocation) {
+      if (hasValidUserLocation && userLocation) {
         searchParams.append("lat", String(userLocation.latitude));
         searchParams.append("lng", String(userLocation.longitude));
       }
 
-      if (appliedFilters.radiusKm != null && userLocation) {
+      if (appliedFilters.radiusKm != null && hasValidUserLocation && userLocation) {
         searchParams.append("radius_km", String(appliedFilters.radiusKm));
       }
 
       const qs = searchParams.toString();
-      const data = await request<{ events: Event[] }>(qs ? `/api/events?${qs}` : "/api/events", { timeoutMs: 20000 });
+      const data = await request<{ events: Event[] }>(qs ? `/api/events?${qs}` : "/api/events", {
+        timeoutMs: 20000,
+        signal: abortController.signal,
+      });
+      if (!isActiveRequest()) {
+        return;
+      }
+
       const nextEvents = data.events ?? [];
+
+      if (railAtStart !== "all" && nextEvents.length === 0) {
+        setRailNotice("No events found — showing all events.");
+        setSelectedRailCategory("all");
+
+        setAppliedFilters((prev) => {
+          if (prev.categoryId == null && prev.subcategoryId == null && prev.tagId == null) {
+            return prev;
+          }
+          return {
+            ...prev,
+            categoryId: null,
+            subcategoryId: null,
+            tagId: null,
+          };
+        });
+
+        setDraftFilters((prev) => ({
+          ...prev,
+          categoryId: null,
+          subcategoryId: null,
+          tagId: null,
+        }));
+
+        setError(null);
+        setIsUsingCachedResults(false);
+        setCachedIndicator(null);
+        return;
+      }
 
       setEvents(nextEvents);
       if (nextEvents.length > 0) {
@@ -680,8 +907,20 @@ export default function DiscoverScreen() {
       setIsUsingCachedResults(false);
       setCachedIndicator(null);
     } catch (err) {
+      if (!isActiveRequest()) {
+        return;
+      }
+
       const message = toDiscoverErrorMessage(err);
+      if (message === "Request canceled") {
+        return;
+      }
+
       const dbHealthy = await checkDbHealth();
+      if (!isActiveRequest()) {
+        return;
+      }
+
       const cachedEvents = lastSuccessfulEventsRef.current;
 
       if (cachedEvents && cachedEvents.length > 0) {
@@ -697,6 +936,12 @@ export default function DiscoverScreen() {
 
       console.error("Discover fetch error", message);
     } finally {
+      if (!isActiveRequest()) {
+        return;
+      }
+      if (eventsAbortRef.current === abortController) {
+        eventsAbortRef.current = null;
+      }
       setLoading(false);
     }
   }, [
@@ -708,6 +953,7 @@ export default function DiscoverScreen() {
     appliedFilters.minRating,
     appliedFilters.radiusKm,
     userLocation,
+    hasValidUserLocation,
     checkDbHealth,
   ]);
 
@@ -746,6 +992,15 @@ export default function DiscoverScreen() {
           style={styles.searchInput}
         />
 
+        <View style={styles.categoryRailWrap}>
+          <CategoryRail chips={railChips} selectedKey={selectedRailCategory} onSelect={handleSelectRailChip} />
+          {railNotice && (
+            <View style={styles.railNoticePill}>
+              <Text style={styles.railNoticeText}>{railNotice}</Text>
+            </View>
+          )}
+        </View>
+
         <View style={styles.embeddedMapContainer}>
           <MapView
             style={styles.embeddedMap}
@@ -753,9 +1008,11 @@ export default function DiscoverScreen() {
             pointerEvents="none"
             region={getPreviewRegion()}
           >
-            {userLocation && <Marker coordinate={userLocation} title="Your location" pinColor={USER_PIN_COLOR} />}
+            {hasValidUserLocation && userLocation && (
+              <Marker coordinate={userLocation} title="Your location" pinColor={USER_PIN_COLOR} />
+            )}
             {discoverEvents.map((event) => {
-              if (event.latitude == null || event.longitude == null) return null;
+              if (!hasValidCoordinate(event)) return null;
               return (
                 <Marker
                   key={event.id}
@@ -1200,7 +1457,7 @@ export default function DiscoverScreen() {
               }}
               onLongPress={(event) => handleDropPin(event.nativeEvent.coordinate)}
             >
-              {userLocation && (
+              {hasValidUserLocation && userLocation && (
                 <Marker
                   coordinate={userLocation}
                   title="Your location"
@@ -1210,7 +1467,7 @@ export default function DiscoverScreen() {
                 />
               )}
               {discoverEvents.map((event) => {
-                if (event.latitude == null || event.longitude == null) return null;
+                if (!hasValidCoordinate(event)) return null;
                 return (
                   <Marker
                     key={event.id}
@@ -1376,6 +1633,23 @@ const styles = StyleSheet.create({
     color: PALETTE.text,
     backgroundColor: PALETTE.surface,
     fontSize: 14,
+  },
+  categoryRailWrap: {
+    gap: 8,
+  },
+  railNoticePill: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  railNoticeText: {
+    color: PALETTE.muted,
+    fontSize: 12,
+    fontWeight: "600",
   },
   embeddedMapContainer: {
     height: 240,

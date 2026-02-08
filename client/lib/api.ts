@@ -22,9 +22,27 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     throw new Error("API base URL is not set. Define EXPO_PUBLIC_API_URL.");
   }
 
-  const { timeoutMs = 8000, ...rest } = options;
+  const { timeoutMs = 8000, signal: externalSignal, ...rest } = options;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  let canceled = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  const abortFromExternal = () => {
+    canceled = true;
+    controller.abort();
+  };
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abortFromExternal();
+    } else {
+      externalSignal.addEventListener("abort", abortFromExternal, { once: true });
+    }
+  }
 
   const isAuthEndpoint = path.startsWith("/api/auth/");
 
@@ -101,10 +119,19 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     return (await response.json()) as T;
   } catch (error) {
     if ((error as Error).name === "AbortError") {
+      if (canceled) {
+        throw new Error("Request canceled");
+      }
+      if (timedOut) {
+        throw new Error("Request timed out");
+      }
       throw new Error("Request timed out");
     }
     throw error;
   } finally {
+    if (externalSignal) {
+      externalSignal.removeEventListener("abort", abortFromExternal);
+    }
     clearTimeout(timer);
   }
 }
