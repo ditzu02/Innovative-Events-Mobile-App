@@ -19,6 +19,7 @@ import MapView, { Callout, Marker, PROVIDER_GOOGLE, Region } from "react-native-
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { EventCard, EventCardViewModel } from "@/components/EventCard";
 import {
   applyClientSideFilters,
   AudienceSegment,
@@ -29,6 +30,14 @@ import {
   getActiveFilterCount,
   PriceBand,
 } from "@/lib/discover-filters";
+import {
+  EventStatus,
+  formatEventTime,
+  formatLocationLabel,
+  formatPrice,
+  getEventStatus,
+  pickTopTags,
+} from "@/lib/event-formatting";
 import { request } from "@/lib/api";
 
 type Event = {
@@ -38,12 +47,15 @@ type Event = {
   start_time: string;
   end_time: string;
   description?: string | null;
+  cover_image_url?: string | null;
   location?: {
     name?: string | null;
+    address?: string | null;
     features?: unknown;
   } | null;
   price?: number | null;
   rating_avg?: number | null;
+  rating_count?: number | null;
   tags?: string[];
   latitude?: number | null;
   longitude?: number | null;
@@ -64,6 +76,8 @@ type Option = {
   label: string;
   value: string;
 };
+
+type DiscoverCardViewModel = EventCardViewModel & { event: Event };
 
 const FALLBACK_TAG_OPTIONS = ["Rock", "Jazz", "Outdoor", "Dj", "Live", "Electronic"];
 const FALLBACK_CATEGORY_OPTIONS = ["Music", "Party", "Art"];
@@ -152,6 +166,34 @@ function filtersEqual(a: DiscoverFilters, b: DiscoverFilters) {
   return a.venueFeatures.every((item, index) => item === b.venueFeatures[index]);
 }
 
+function getPlaceholderToken(category: string | null, title: string): string {
+  const source = category?.trim() || title.trim();
+  if (!source) return "EV";
+  const match = source.match(/[A-Za-z0-9]/);
+  return (match?.[0] ?? "E").toUpperCase();
+}
+
+function getStatusLabel(
+  status: Exclude<EventStatus, "ENDED">,
+  startTime: string,
+  now: Date
+): string | null {
+  if (status === "LIVE") {
+    return "LIVE NOW";
+  }
+
+  if (status === "SOON") {
+    const start = new Date(startTime);
+    if (Number.isNaN(start.getTime())) {
+      return "Starts Soon";
+    }
+    const hours = Math.max(1, Math.ceil((start.getTime() - now.getTime()) / (60 * 60 * 1000)));
+    return `Starts in ${hours}h`;
+  }
+
+  return null;
+}
+
 export default function DiscoverScreen() {
   const router = useRouter();
 
@@ -188,6 +230,7 @@ export default function DiscoverScreen() {
 
   const [isUsingCachedResults, setIsUsingCachedResults] = useState(false);
   const [cachedIndicator, setCachedIndicator] = useState<string | null>(null);
+  const [clockTick, setClockTick] = useState<number>(() => Date.now());
 
   const mapRef = useRef<MapView | null>(null);
   const mapRegionRef = useRef<Region>(DEFAULT_REGION);
@@ -267,6 +310,46 @@ export default function DiscoverScreen() {
     [events, appliedFilters]
   );
 
+  const cardViewModels = useMemo<DiscoverCardViewModel[]>(() => {
+    const now = new Date(clockTick);
+
+    return displayEvents.flatMap((event) => {
+      const status = getEventStatus(event.start_time, event.end_time, now);
+      if (status === "ENDED") {
+        return [];
+      }
+
+      const { visibleTags } = pickTopTags(event.tags, 2);
+      const ratingCount = event.rating_count ?? 0;
+      const ratingLabel =
+        event.rating_avg != null && ratingCount > 0
+          ? `★ ${event.rating_avg.toFixed(1)} (${ratingCount})`
+          : null;
+
+      const model: DiscoverCardViewModel = {
+        id: event.id,
+        event,
+        title: event.title,
+        status,
+        statusLabel: getStatusLabel(status, event.start_time, now),
+        coverImageUrl: event.cover_image_url?.trim() || null,
+        placeholderToken: getPlaceholderToken(event.category, event.title),
+        timeLabel: formatEventTime(event.start_time, event.end_time, now),
+        locationLabel: formatLocationLabel(event.distance_km, event.location?.address, event.location?.name),
+        priceLabel: formatPrice(event.price),
+        visibleTags,
+        ratingLabel,
+      };
+
+      return [model];
+    });
+  }, [displayEvents, clockTick]);
+
+  const discoverEvents = useMemo(
+    () => cardViewModels.map((item) => item.event),
+    [cardViewModels]
+  );
+
   const venueFeatureOptions = useMemo(() => collectVenueFeatureOptions(events ?? []), [events]);
 
   const activeFilterCount = useMemo(() => getActiveFilterCount(appliedFilters), [appliedFilters]);
@@ -285,7 +368,7 @@ export default function DiscoverScreen() {
       };
     }
 
-    const markerSource = displayEvents.length > 0 ? displayEvents : events ?? [];
+    const markerSource = discoverEvents.length > 0 ? discoverEvents : [];
     const firstWithCoords = markerSource.find((event) => event.latitude != null && event.longitude != null);
     if (firstWithCoords?.latitude != null && firstWithCoords.longitude != null) {
       const current = mapRegionRef.current ?? DEFAULT_REGION;
@@ -298,7 +381,7 @@ export default function DiscoverScreen() {
     }
 
     return mapRegionRef.current ?? DEFAULT_REGION;
-  }, [userLocation, displayEvents, events]);
+  }, [userLocation, discoverEvents]);
 
   const getTargetRegion = useCallback(() => {
     const current = mapRegionRef.current ?? DEFAULT_REGION;
@@ -332,14 +415,14 @@ export default function DiscoverScreen() {
   );
 
   const visibleEvents = useMemo(() => {
-    if (!mapRegion) return displayEvents;
+    if (!mapRegion) return discoverEvents;
     const { latitude, longitude, latitudeDelta, longitudeDelta } = mapRegion;
     const minLat = latitude - latitudeDelta / 2;
     const maxLat = latitude + latitudeDelta / 2;
     const minLng = longitude - longitudeDelta / 2;
     const maxLng = longitude + longitudeDelta / 2;
 
-    return displayEvents.filter(
+    return discoverEvents.filter(
       (event) =>
         event.latitude != null &&
         event.longitude != null &&
@@ -348,7 +431,7 @@ export default function DiscoverScreen() {
         event.longitude >= minLng &&
         event.longitude <= maxLng
     );
-  }, [mapRegion, displayEvents]);
+  }, [mapRegion, discoverEvents]);
 
   const handleOpenEvent = useCallback((id: string) => {
     setSelectedEvent(null);
@@ -430,6 +513,13 @@ export default function DiscoverScreen() {
   }, [searchQuery]);
 
   useEffect(() => {
+    const timer = setInterval(() => {
+      setClockTick(Date.now());
+    }, 60 * 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     mapRegionRef.current = mapRegion;
   }, [mapRegion]);
 
@@ -455,17 +545,17 @@ export default function DiscoverScreen() {
 
   useEffect(() => {
     if (!selectedEvent) return;
-    if (!displayEvents.some((event) => event.id === selectedEvent.id)) {
+    if (!discoverEvents.some((event) => event.id === selectedEvent.id)) {
       setSelectedEvent(null);
     }
-  }, [displayEvents, selectedEvent]);
+  }, [discoverEvents, selectedEvent]);
 
   useEffect(() => {
     if (hasAutoCenteredRef.current) return;
     if (userLocation) return;
-    if (!events?.length) return;
+    if (!discoverEvents.length) return;
 
-    const firstWithCoords = events.find((event) => event.latitude != null && event.longitude != null);
+    const firstWithCoords = discoverEvents.find((event) => event.latitude != null && event.longitude != null);
     if (firstWithCoords?.latitude == null || firstWithCoords.longitude == null) {
       return;
     }
@@ -481,7 +571,7 @@ export default function DiscoverScreen() {
     };
 
     setMapRegion(nextRegion);
-  }, [events, userLocation]);
+  }, [discoverEvents, userLocation]);
 
   const sanitizeFilters = useCallback(
     (filters: DiscoverFilters): DiscoverFilters => {
@@ -664,7 +754,7 @@ export default function DiscoverScreen() {
             region={getPreviewRegion()}
           >
             {userLocation && <Marker coordinate={userLocation} title="Your location" pinColor={USER_PIN_COLOR} />}
-            {displayEvents.map((event) => {
+            {discoverEvents.map((event) => {
               if (event.latitude == null || event.longitude == null) return null;
               return (
                 <Marker
@@ -717,7 +807,7 @@ export default function DiscoverScreen() {
             </View>
           )}
 
-          {events && displayEvents.length === 0 && !loading && !error && (
+          {events && cardViewModels.length === 0 && !loading && !error && (
             <View style={styles.emptyState}>
               <Text style={styles.emptyTitle}>No events match the filters.</Text>
               <Text style={styles.emptySubtitle}>Try clearing filters or dropping a pin to widen the search.</Text>
@@ -739,31 +829,17 @@ export default function DiscoverScreen() {
             </View>
           )}
 
-          {displayEvents.length > 0 && (
+          {cardViewModels.length > 0 && (
             <FlatList
-              data={displayEvents}
+              data={cardViewModels}
               keyExtractor={(item) => item.id}
               scrollEnabled={false}
               ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
               renderItem={({ item }) => (
-                <Pressable
+                <EventCard
+                  model={item}
                   onPress={() => router.push(`/event/${item.id}`)}
-                  style={({ pressed }) => [styles.card, pressed && { opacity: 0.9 }]}
-                >
-                  <Text style={styles.cardTitle}>{item.title}</Text>
-                  {item.category && <Text style={styles.cardMeta}>{item.category}</Text>}
-                  <Text style={styles.cardMeta}>{item.location?.name ?? "Unknown location"}</Text>
-                  {item.price != null && <Text style={styles.cardMeta}>€{item.price.toFixed(2)}</Text>}
-                  {item.distance_km != null && <Text style={styles.cardMeta}>{item.distance_km.toFixed(1)} km away</Text>}
-                  <View style={styles.badgeRow}>
-                    {item.tags?.slice(0, 3).map((tag) => (
-                      <View key={tag} style={styles.badge}>
-                        <Text style={styles.badgeText}>{tag}</Text>
-                      </View>
-                    ))}
-                  </View>
-                  {item.rating_avg != null && <Text style={styles.cardMeta}>⭐ {item.rating_avg.toFixed(1)}</Text>}
-                </Pressable>
+                />
               )}
             />
           )}
@@ -1133,7 +1209,7 @@ export default function DiscoverScreen() {
                   onDragEnd={(event) => handleDropPin(event.nativeEvent.coordinate)}
                 />
               )}
-              {displayEvents.map((event) => {
+              {discoverEvents.map((event) => {
                 if (event.latitude == null || event.longitude == null) return null;
                 return (
                   <Marker
