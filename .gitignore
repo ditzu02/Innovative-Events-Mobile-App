@@ -33,4 +33,5 @@ server/.ruff_cache
 .vscode
 
 # Local planning notes
+/plan.md
 Hierarchical Tags Makeover (Additive, Minimal-Change) — Executable Plan.md
