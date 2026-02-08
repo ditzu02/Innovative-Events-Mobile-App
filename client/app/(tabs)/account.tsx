@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useAuth } from "@/context/auth";
+import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { isAdminEmail } from "@/constants/config";
 
 const PALETTE = {
   background: "#0b0a12",
@@ -18,6 +20,7 @@ const PALETTE = {
 
 export default function AccountScreen() {
   const { user, isAuthed, authLoading, signIn, signUp, signOut, updateProfile } = useAuth();
+  const router = useRouter();
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -225,6 +228,14 @@ export default function AccountScreen() {
           >
             <Text style={styles.secondaryButtonText}>Sign out</Text>
           </Pressable>
+          {isAdminEmail(user.email) && (
+            <Pressable
+              onPress={() => router.push("/admin/taxonomy")}
+              style={({ pressed }) => [styles.secondaryButton, pressed && { opacity: 0.8 }]}
+            >
+              <Text style={styles.secondaryButtonText}>Admin taxonomy</Text>
+            </Pressable>
+          )}
           </View>
         )}
       </ScrollView>

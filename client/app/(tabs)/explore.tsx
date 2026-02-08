@@ -23,10 +23,19 @@ type Event = {
 };
 
 type CityOption = { name: string; latitude: number; longitude: number };
+type TaxonomyNode = { id: string; name: string; slug: string };
+type TaxonomySubcategory = TaxonomyNode & { tags: TaxonomyNode[] };
+type TaxonomyCategory = TaxonomyNode & { subcategories: TaxonomySubcategory[] };
+type FiltersResponse = {
+  tags: string[];
+  categories: string[];
+  cities: CityOption[];
+  taxonomy_version?: string;
+  taxonomy?: { categories: TaxonomyCategory[] };
+};
 
 const FALLBACK_TAG_OPTIONS = ["Rock", "Jazz", "Outdoor", "Dj", "Live", "Electronic"];
 const FALLBACK_CATEGORY_OPTIONS = ["Music", "Party", "Art"];
-const RATING_OPTIONS = [4.5, 4, 3];
 const FALLBACK_CITIES: CityOption[] = [
   { name: "Vienna", latitude: 48.2082, longitude: 16.3738 },
   { name: "San Francisco", latitude: 37.7749, longitude: -122.4194 },
@@ -47,6 +56,28 @@ const PALETTE = {
 };
 const USER_PIN_COLOR = PALETTE.accent;
 
+function slugifyLabel(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function labelsToNodes(labels: string[], prefix: string): TaxonomyNode[] {
+  const counts = new Map<string, number>();
+  return labels.map((label) => {
+    const slug = slugifyLabel(label);
+    const next = (counts.get(slug) ?? 0) + 1;
+    counts.set(slug, next);
+    return {
+      id: `${prefix}-${slug || "item"}-${next}`,
+      name: label,
+      slug: slug || `${prefix}-${next}`,
+    };
+  });
+}
+
 function toDiscoverErrorMessage(err: unknown) {
   const message = err instanceof Error ? err.message : "Unknown error";
   if (message === "Request timed out") {
@@ -59,8 +90,9 @@ export default function DiscoverScreen() {
   const [events, setEvents] = useState<Event[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedTag, setSelectedTag] = useState<string | null>(null);
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [selectedTag, setSelectedTag] = useState<TaxonomyNode | null>(null);
+  const [selectedCategory, setSelectedCategory] = useState<TaxonomyNode | null>(null);
+  const [selectedSubcategory, setSelectedSubcategory] = useState<TaxonomyNode | null>(null);
   const [selectedCity, setSelectedCity] = useState<string | null>(null);
   const [cityQuery, setCityQuery] = useState<string>("");
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -81,8 +113,12 @@ export default function DiscoverScreen() {
   const [showListOverlay, setShowListOverlay] = useState(false);
   const [mapRegion, setMapRegion] = useState<Region>(() => DEFAULT_REGION);
   const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null);
-  const [availableTags, setAvailableTags] = useState<string[]>(FALLBACK_TAG_OPTIONS);
-  const [availableCategories, setAvailableCategories] = useState<string[]>(FALLBACK_CATEGORY_OPTIONS);
+  const [taxonomyCategories, setTaxonomyCategories] = useState<TaxonomyCategory[] | null>(null);
+  const [taxonomyVersion, setTaxonomyVersion] = useState<string | null>(null);
+  const [availableTags, setAvailableTags] = useState<TaxonomyNode[]>(() => labelsToNodes(FALLBACK_TAG_OPTIONS, "tag"));
+  const [availableCategories, setAvailableCategories] = useState<TaxonomyNode[]>(() =>
+    labelsToNodes(FALLBACK_CATEGORY_OPTIONS, "category")
+  );
   const [availableCities, setAvailableCities] = useState<CityOption[]>(FALLBACK_CITIES);
   const [filtersError, setFiltersError] = useState<string | null>(null);
   const mapRef = useRef<MapView | null>(null);
@@ -91,6 +127,18 @@ export default function DiscoverScreen() {
   const locationLabel = userLocation
     ? `${userLocation.latitude.toFixed(4)}, ${userLocation.longitude.toFixed(4)}`
     : "Not set";
+  const taxonomyEnabled = !!taxonomyCategories?.length;
+  const selectedCategoryTree = useMemo(
+    () => taxonomyCategories?.find((item) => item.id === selectedCategory?.id) ?? null,
+    [taxonomyCategories, selectedCategory?.id]
+  );
+  const availableSubcategories = selectedCategoryTree?.subcategories ?? [];
+  const selectedSubcategoryTree = useMemo(
+    () => availableSubcategories.find((item) => item.id === selectedSubcategory?.id) ?? null,
+    [availableSubcategories, selectedSubcategory?.id]
+  );
+  const availableHierarchyTags = selectedSubcategoryTree?.tags ?? [];
+
   const getRegionForCity = useCallback(
     (city: string | null) => {
       const base = { latitudeDelta: 0.2, longitudeDelta: 0.2 };
@@ -171,6 +219,7 @@ export default function DiscoverScreen() {
   const handleClearFilters = useCallback(() => {
     setSelectedTag(null);
     setSelectedCategory(null);
+    setSelectedSubcategory(null);
     setSelectedCity(null);
     setCityQuery("");
     setSearchQuery("");
@@ -185,6 +234,7 @@ export default function DiscoverScreen() {
     let count = 0;
     if (selectedTag) count += 1;
     if (selectedCategory) count += 1;
+    if (selectedSubcategory) count += 1;
     if (selectedCity) count += 1;
     if (selectedDate) count += 1;
     if (selectedTime) count += 1;
@@ -196,6 +246,7 @@ export default function DiscoverScreen() {
   }, [
     selectedTag,
     selectedCategory,
+    selectedSubcategory,
     selectedCity,
     selectedDate,
     selectedTime,
@@ -209,12 +260,23 @@ export default function DiscoverScreen() {
     let cancelled = false;
     (async () => {
       try {
-        const data = await request<{ tags: string[]; categories: string[]; cities: CityOption[] }>("/api/filters", {
+        const data = await request<FiltersResponse>("/api/filters", {
           timeoutMs: 12000,
         });
         if (cancelled) return;
-        setAvailableTags(data.tags?.length ? data.tags : FALLBACK_TAG_OPTIONS);
-        setAvailableCategories(data.categories?.length ? data.categories : FALLBACK_CATEGORY_OPTIONS);
+        const taxonomy = data.taxonomy?.categories?.length ? data.taxonomy.categories : null;
+        setTaxonomyCategories(taxonomy);
+        setTaxonomyVersion(data.taxonomy_version ?? null);
+
+        const fallbackTags = data.tags?.length ? data.tags : FALLBACK_TAG_OPTIONS;
+        const fallbackCategories = data.categories?.length ? data.categories : FALLBACK_CATEGORY_OPTIONS;
+        setAvailableTags(labelsToNodes(fallbackTags, "tag"));
+        if (taxonomy) {
+          setAvailableCategories(taxonomy.map(({ id, name, slug }) => ({ id, name, slug })));
+        } else {
+          setAvailableCategories(labelsToNodes(fallbackCategories, "category"));
+          setSelectedSubcategory(null);
+        }
         setAvailableCities(data.cities?.length ? data.cities : FALLBACK_CITIES);
         setFiltersError(null);
       } catch (err) {
@@ -256,6 +318,36 @@ export default function DiscoverScreen() {
   }, [selectedCity, userLocation, getRegionForCity]);
 
   useEffect(() => {
+    if (!taxonomyEnabled) return;
+    if (selectedCategory && !selectedCategoryTree) {
+      setSelectedCategory(null);
+      setSelectedSubcategory(null);
+      setSelectedTag(null);
+      return;
+    }
+    if (selectedSubcategory && !selectedSubcategoryTree) {
+      setSelectedSubcategory(null);
+      setSelectedTag(null);
+      return;
+    }
+    if (
+      selectedTag &&
+      selectedSubcategory &&
+      !availableHierarchyTags.some((item) => item.id === selectedTag.id)
+    ) {
+      setSelectedTag(null);
+    }
+  }, [
+    taxonomyEnabled,
+    selectedCategory,
+    selectedCategoryTree,
+    selectedSubcategory,
+    selectedSubcategoryTree,
+    selectedTag,
+    availableHierarchyTags,
+  ]);
+
+  useEffect(() => {
     if (!mapExpanded && pendingNavId) {
       const id = pendingNavId;
       setPendingNavId(null);
@@ -280,8 +372,9 @@ export default function DiscoverScreen() {
       try {
         const searchParams = new URLSearchParams();
         const trimmedSearch = debouncedQuery.trim();
-        if (selectedTag) searchParams.append("tag", selectedTag.toLowerCase());
-        if (selectedCategory) searchParams.append("category", selectedCategory);
+        if (selectedTag) searchParams.append("tag", selectedTag.slug);
+        if (selectedCategory) searchParams.append("category", selectedCategory.slug);
+        if (selectedSubcategory) searchParams.append("subcategory", selectedSubcategory.slug);
         if (selectedCity) searchParams.append("city", selectedCity);
         if (sort) searchParams.append("sort", sort === "date" ? "soonest" : sort);
         if (selectedDate) searchParams.append("date", selectedDate.toISOString().split("T")[0]);
@@ -307,7 +400,20 @@ export default function DiscoverScreen() {
         setLoading(false);
       }
     },
-    [selectedTag, selectedCategory, selectedCity, selectedDate, selectedTime, sort, minRating, debouncedQuery, radiusKm, userLocation, mapExpanded]
+    [
+      selectedTag?.id,
+      selectedCategory?.id,
+      selectedSubcategory?.id,
+      selectedCity,
+      selectedDate,
+      selectedTime,
+      sort,
+      minRating,
+      debouncedQuery,
+      radiusKm,
+      userLocation,
+      mapExpanded,
+    ]
   );
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -465,18 +571,57 @@ export default function DiscoverScreen() {
               )}
             </View>
 
-            <FilterChips
-              label="Tags"
-              options={availableTags}
-              selected={selectedTag}
-              onSelect={(val) => setSelectedTag(val)}
-            />
-            <FilterChips
-              label="Category"
-              options={availableCategories}
-              selected={selectedCategory}
-              onSelect={(val) => setSelectedCategory(val)}
-            />
+            {taxonomyEnabled ? (
+              <>
+                <NodeFilterChips
+                  label="Category"
+                  options={availableCategories}
+                  selectedId={selectedCategory?.id ?? null}
+                  onSelect={(node) => {
+                    setSelectedCategory(node);
+                    setSelectedSubcategory(null);
+                    setSelectedTag(null);
+                  }}
+                />
+                {selectedCategory && (
+                  <NodeFilterChips
+                    label="Subcategory"
+                    options={availableSubcategories}
+                    selectedId={selectedSubcategory?.id ?? null}
+                    onSelect={(node) => {
+                      setSelectedSubcategory(node);
+                      setSelectedTag(null);
+                    }}
+                  />
+                )}
+                {selectedSubcategory && (
+                  <NodeFilterChips
+                    label="Tags"
+                    options={availableHierarchyTags}
+                    selectedId={selectedTag?.id ?? null}
+                    onSelect={(node) => setSelectedTag(node)}
+                  />
+                )}
+                {taxonomyVersion && (
+                  <Text style={styles.helperText}>Taxonomy version: {taxonomyVersion}</Text>
+                )}
+              </>
+            ) : (
+              <>
+                <NodeFilterChips
+                  label="Tags"
+                  options={availableTags}
+                  selectedId={selectedTag?.id ?? null}
+                  onSelect={(node) => setSelectedTag(node)}
+                />
+                <NodeFilterChips
+                  label="Category"
+                  options={availableCategories}
+                  selectedId={selectedCategory?.id ?? null}
+                  onSelect={(node) => setSelectedCategory(node)}
+                />
+              </>
+            )}
             <View style={{ gap: 6 }}>
               <Text style={styles.chipLabel}>Min Rating: {minRating ? minRating.toFixed(1) : "Any"}</Text>
               <Slider
@@ -821,6 +966,37 @@ function formatTime(d: Date) {
   } catch {
     return "";
   }
+}
+
+type NodeChipsProps = {
+  label: string;
+  options: TaxonomyNode[];
+  selectedId: string | null;
+  onSelect: (val: TaxonomyNode | null) => void;
+};
+
+function NodeFilterChips({ label, options, selectedId, onSelect }: NodeChipsProps) {
+  return (
+    <View style={{ gap: 6 }}>
+      <Text style={styles.chipLabel}>{label}</Text>
+      <View style={styles.badgeRow}>
+        {options.map((opt) => {
+          const isSelected = selectedId === opt.id;
+          return (
+            <Pressable
+              key={opt.id}
+              onPress={() => onSelect(isSelected ? null : opt)}
+              style={[styles.badge, isSelected && styles.badgeSelected]}
+            >
+              <Text style={[styles.badgeText, isSelected && styles.badgeSelectedText]}>
+                {opt.name}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    </View>
+  );
 }
 
 type ChipsProps = {

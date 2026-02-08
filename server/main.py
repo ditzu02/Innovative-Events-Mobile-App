@@ -1,12 +1,15 @@
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
 import os
 from pathlib import Path
 from decimal import Decimal
 import math
+import re
 import secrets
+import time
 import uuid
+from typing import Any
 
 import psycopg2
 from psycopg2 import OperationalError, InterfaceError, IntegrityError
@@ -55,6 +58,13 @@ logger.info("Loaded database configuration for host=%s port=%s db=%s", DB_HOST, 
 JWT_SECRET = os.getenv("JWT_SECRET")
 ACCESS_TOKEN_TTL_MIN = int(os.getenv("ACCESS_TOKEN_TTL_MIN", "15"))
 REFRESH_TOKEN_TTL_DAYS = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "30"))
+TAXONOMY_CACHE_TTL_SEC = max(60, min(300, int(os.getenv("TAXONOMY_CACHE_TTL_SEC", "120"))))
+
+ADMIN_EMAILS = {
+    item.strip().lower()
+    for item in str(os.getenv("ADMIN_EMAILS", "")).split(",")
+    if item.strip()
+}
 
 if not JWT_SECRET:
     logger.warning("JWT_SECRET is not set. Auth endpoints will not work until it is configured.")
@@ -66,6 +76,18 @@ pwd_context = CryptContext(
 )
 
 db_pool: SimpleConnectionPool | None = None
+
+# cache for taxonomy resolver + filter payload
+taxonomy_cache: dict[str, Any] = {
+    "expires_at": 0.0,
+    "data": None,
+}
+
+# cache for admin taxonomy payload (includes counts)
+admin_taxonomy_cache: dict[str, Any] = {
+    "expires_at": 0.0,
+    "data": None,
+}
 
 
 def init_db_pool(force: bool = False) -> None:
@@ -279,6 +301,482 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 6371 * c
 
 
+def is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def slugify(value: str) -> str:
+    lowered = value.strip().lower()
+    lowered = re.sub(r"[^a-z0-9]+", "-", lowered)
+    return lowered.strip("-")
+
+
+def _single_candidate_or_error(candidates: set[str], label: str, raw_value: str) -> str:
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if not candidates:
+        raise ValueError(f"Unknown {label} '{raw_value}'.")
+    raise ValueError(
+        f"Ambiguous {label} '{raw_value}'. Please specify parent filters for precise matching."
+    )
+
+
+def _compute_taxonomy_version(
+    max_created_at: datetime | None,
+    category_count: int,
+    subcategory_count: int,
+    tag_count: int,
+) -> str:
+    if not max_created_at:
+        ts = 0
+    else:
+        ts = int(max_created_at.timestamp())
+    return f"{ts}-{category_count}-{subcategory_count}-{tag_count}"
+
+
+def _build_taxonomy_cache_payload(rows) -> dict[str, Any]:
+    categories_by_id: dict[str, dict[str, Any]] = {}
+    subcategories_by_id: dict[str, dict[str, Any]] = {}
+    tags_by_id: dict[str, dict[str, Any]] = {}
+
+    category_slug_to_id: dict[str, str] = {}
+    category_name_to_ids: dict[str, set[str]] = {}
+    subcategory_slug_to_ids: dict[str, set[str]] = {}
+    subcategory_name_to_ids: dict[str, set[str]] = {}
+    subcategory_name_by_category: dict[tuple[str, str], set[str]] = {}
+    tag_slug_to_ids: dict[str, set[str]] = {}
+    tag_name_to_ids: dict[str, set[str]] = {}
+    tag_name_by_subcategory: dict[tuple[str, str], set[str]] = {}
+
+    subcategory_meta: dict[str, dict[str, str]] = {}
+    tag_meta: dict[str, dict[str, str]] = {}
+    subcategories_by_category_id: dict[str, set[str]] = {}
+    tags_by_subcategory_id: dict[str, set[str]] = {}
+
+    max_created_at: datetime | None = None
+
+    for row in rows:
+        (
+            category_id,
+            category_name,
+            category_slug,
+            category_created_at,
+            subcategory_id,
+            subcategory_name,
+            subcategory_slug,
+            subcategory_created_at,
+            tag_id,
+            tag_name,
+            tag_slug,
+            tag_created_at,
+        ) = row
+
+        if category_id is None:
+            continue
+
+        category_id_str = str(category_id)
+        category_slug_norm = str(category_slug or "").strip().lower()
+        category_name_str = str(category_name or "").strip()
+        category_name_key = category_name_str.lower()
+
+        if category_created_at and (max_created_at is None or category_created_at > max_created_at):
+            max_created_at = category_created_at
+        if category_id_str not in categories_by_id:
+            categories_by_id[category_id_str] = {
+                "id": category_id_str,
+                "name": category_name_str,
+                "slug": category_slug_norm,
+                "subcategories": [],
+            }
+        if category_slug_norm:
+            category_slug_to_id[category_slug_norm] = category_id_str
+        if category_name_key:
+            category_name_to_ids.setdefault(category_name_key, set()).add(category_id_str)
+        subcategories_by_category_id.setdefault(category_id_str, set())
+
+        if subcategory_id is None:
+            continue
+
+        subcategory_id_str = str(subcategory_id)
+        subcategory_slug_norm = str(subcategory_slug or "").strip().lower()
+        subcategory_name_str = str(subcategory_name or "").strip()
+        subcategory_name_key = subcategory_name_str.lower()
+
+        if subcategory_created_at and (max_created_at is None or subcategory_created_at > max_created_at):
+            max_created_at = subcategory_created_at
+        if subcategory_id_str not in subcategories_by_id:
+            subcategory_node = {
+                "id": subcategory_id_str,
+                "name": subcategory_name_str,
+                "slug": subcategory_slug_norm,
+                "tags": [],
+            }
+            subcategories_by_id[subcategory_id_str] = subcategory_node
+            categories_by_id[category_id_str]["subcategories"].append(subcategory_node)
+
+        subcategory_meta[subcategory_id_str] = {
+            "category_id": category_id_str,
+            "name": subcategory_name_str,
+            "slug": subcategory_slug_norm,
+        }
+        subcategories_by_category_id[category_id_str].add(subcategory_id_str)
+        tags_by_subcategory_id.setdefault(subcategory_id_str, set())
+        if subcategory_slug_norm:
+            subcategory_slug_to_ids.setdefault(subcategory_slug_norm, set()).add(subcategory_id_str)
+        if subcategory_name_key:
+            subcategory_name_to_ids.setdefault(subcategory_name_key, set()).add(subcategory_id_str)
+            subcategory_name_by_category.setdefault(
+                (category_id_str, subcategory_name_key), set()
+            ).add(subcategory_id_str)
+
+        if tag_id is None:
+            continue
+
+        tag_id_str = str(tag_id)
+        tag_slug_norm = str(tag_slug or "").strip().lower()
+        tag_name_str = str(tag_name or "").strip()
+        tag_name_key = tag_name_str.lower()
+
+        if tag_created_at and (max_created_at is None or tag_created_at > max_created_at):
+            max_created_at = tag_created_at
+        if tag_id_str not in tags_by_id:
+            tag_node = {"id": tag_id_str, "name": tag_name_str, "slug": tag_slug_norm}
+            tags_by_id[tag_id_str] = tag_node
+            subcategories_by_id[subcategory_id_str]["tags"].append(tag_node)
+
+        tag_meta[tag_id_str] = {
+            "subcategory_id": subcategory_id_str,
+            "category_id": category_id_str,
+            "name": tag_name_str,
+            "slug": tag_slug_norm,
+        }
+        tags_by_subcategory_id[subcategory_id_str].add(tag_id_str)
+        if tag_slug_norm:
+            tag_slug_to_ids.setdefault(tag_slug_norm, set()).add(tag_id_str)
+        if tag_name_key:
+            tag_name_to_ids.setdefault(tag_name_key, set()).add(tag_id_str)
+            tag_name_by_subcategory.setdefault((subcategory_id_str, tag_name_key), set()).add(tag_id_str)
+
+    categories = list(categories_by_id.values())
+    categories.sort(key=lambda item: item["name"].lower())
+    for category in categories:
+        category["subcategories"].sort(key=lambda item: item["name"].lower())
+        for subcategory in category["subcategories"]:
+            subcategory["tags"].sort(key=lambda item: item["name"].lower())
+
+    category_count = len(categories_by_id)
+    subcategory_count = len(subcategories_by_id)
+    tag_count = len(tags_by_id)
+    taxonomy_version = _compute_taxonomy_version(max_created_at, category_count, subcategory_count, tag_count)
+
+    legacy_categories = sorted({category["name"] for category in categories if category["name"]})
+    legacy_tags = sorted(
+        {
+            tag["name"]
+            for category in categories
+            for subcategory in category["subcategories"]
+            for tag in subcategory["tags"]
+            if tag["name"]
+        }
+    )
+
+    return {
+        "taxonomy_version": taxonomy_version,
+        "taxonomy": {"categories": categories},
+        "legacy_categories": legacy_categories,
+        "legacy_tags": legacy_tags,
+        "resolver": {
+            "categories_by_id": categories_by_id,
+            "category_slug_to_id": category_slug_to_id,
+            "category_name_to_ids": category_name_to_ids,
+            "subcategories_by_id": subcategories_by_id,
+            "subcategory_slug_to_ids": subcategory_slug_to_ids,
+            "subcategory_name_to_ids": subcategory_name_to_ids,
+            "subcategory_name_by_category": subcategory_name_by_category,
+            "subcategory_meta": subcategory_meta,
+            "subcategories_by_category_id": subcategories_by_category_id,
+            "tags_by_id": tags_by_id,
+            "tag_slug_to_ids": tag_slug_to_ids,
+            "tag_name_to_ids": tag_name_to_ids,
+            "tag_name_by_subcategory": tag_name_by_subcategory,
+            "tag_meta": tag_meta,
+            "tags_by_subcategory_id": tags_by_subcategory_id,
+        },
+    }
+
+
+def load_taxonomy_cache(cursor, force_refresh: bool = False) -> dict[str, Any] | None:
+    now = time.time()
+    if (
+        not force_refresh
+        and taxonomy_cache["data"] is not None
+        and taxonomy_cache["expires_at"] > now
+    ):
+        return taxonomy_cache["data"]
+
+    try:
+        cursor.execute(
+            """
+            SELECT
+                c.id,
+                c.name,
+                c.slug,
+                c.created_at,
+                sc.id,
+                sc.name,
+                sc.slug,
+                sc.created_at,
+                t.id,
+                t.name,
+                t.slug,
+                t.created_at
+            FROM categories c
+            LEFT JOIN subcategories sc ON sc.category_id = c.id
+            LEFT JOIN tags t ON t.subcategory_id = sc.id
+            ORDER BY c.name ASC, sc.name ASC, t.name ASC
+            """
+        )
+    except psycopg2.Error as exc:
+        if exc.pgcode in ("42P01", "42703"):
+            return None
+        raise
+
+    payload = _build_taxonomy_cache_payload(cursor.fetchall())
+    taxonomy_cache["data"] = payload
+    taxonomy_cache["expires_at"] = now + TAXONOMY_CACHE_TTL_SEC
+    return payload
+
+
+def load_admin_taxonomy_cache(cursor, force_refresh: bool = False) -> dict[str, Any] | None:
+    now = time.time()
+    if (
+        not force_refresh
+        and admin_taxonomy_cache["data"] is not None
+        and admin_taxonomy_cache["expires_at"] > now
+    ):
+        return admin_taxonomy_cache["data"]
+
+    taxonomy_payload = load_taxonomy_cache(cursor, force_refresh=force_refresh)
+    if taxonomy_payload is None:
+        return None
+
+    categories = taxonomy_payload["taxonomy"]["categories"]
+    categories_copy: list[dict[str, Any]] = []
+    tag_counts: dict[str, int] = {}
+
+    cursor.execute(
+        """
+        SELECT et.tag_id::text, COUNT(DISTINCT et.event_id) AS event_count
+        FROM event_tags et
+        GROUP BY et.tag_id
+        """
+    )
+    for tag_id, event_count in cursor.fetchall():
+        tag_counts[tag_id] = int(event_count or 0)
+
+    for category in categories:
+        category_copy = {
+            "id": category["id"],
+            "name": category["name"],
+            "slug": category["slug"],
+            "event_count": 0,
+            "subcategories": [],
+        }
+        for subcategory in category["subcategories"]:
+            subcategory_id = subcategory["id"]
+            tag_count = len(subcategory["tags"])
+            subcategory_copy = {
+                "id": subcategory_id,
+                "name": subcategory["name"],
+                "slug": subcategory["slug"],
+                "tag_count": tag_count,
+                "event_count": 0,
+                "tags": [],
+            }
+            for tag in subcategory["tags"]:
+                event_count = int(tag_counts.get(tag["id"], 0))
+                subcategory_copy["event_count"] += event_count
+                subcategory_copy["tags"].append(
+                    {
+                        "id": tag["id"],
+                        "name": tag["name"],
+                        "slug": tag["slug"],
+                        "event_count": event_count,
+                    }
+                )
+
+            category_copy["event_count"] += subcategory_copy["event_count"]
+            category_copy["subcategories"].append(subcategory_copy)
+        categories_copy.append(category_copy)
+
+    payload = {
+        "taxonomy_version": taxonomy_payload["taxonomy_version"],
+        "taxonomy": {"categories": categories_copy},
+    }
+    admin_taxonomy_cache["data"] = payload
+    admin_taxonomy_cache["expires_at"] = now + TAXONOMY_CACHE_TTL_SEC
+    return payload
+
+
+def _resolve_category_id(raw_value: str, resolver: dict[str, Any]) -> str:
+    value = str(raw_value).strip()
+    if not value:
+        raise ValueError("category cannot be empty")
+
+    if is_uuid(value):
+        key = str(uuid.UUID(value))
+        if key in resolver["categories_by_id"]:
+            return key
+        raise ValueError(f"Unknown category '{raw_value}'.")
+
+    slug = slugify(value)
+    if slug in resolver["category_slug_to_id"]:
+        return resolver["category_slug_to_id"][slug]
+
+    candidate_ids = resolver["category_name_to_ids"].get(value.lower(), set())
+    resolved = _single_candidate_or_error(candidate_ids, "category", raw_value)
+    logger.info("Deprecated category lookup by name used: %s", raw_value)
+    return resolved
+
+
+def _resolve_subcategory_id(
+    raw_value: str,
+    resolver: dict[str, Any],
+    category_id: str | None = None,
+) -> str:
+    value = str(raw_value).strip()
+    if not value:
+        raise ValueError("subcategory cannot be empty")
+
+    if is_uuid(value):
+        key = str(uuid.UUID(value))
+        if key not in resolver["subcategories_by_id"]:
+            raise ValueError(f"Unknown subcategory '{raw_value}'.")
+        if category_id and resolver["subcategory_meta"][key]["category_id"] != category_id:
+            raise ValueError("subcategory does not belong to selected category")
+        return key
+
+    slug = slugify(value)
+    candidates = resolver["subcategory_slug_to_ids"].get(slug, set())
+    if category_id:
+        candidates = {
+            item
+            for item in candidates
+            if resolver["subcategory_meta"][item]["category_id"] == category_id
+        }
+    if candidates:
+        return _single_candidate_or_error(candidates, "subcategory", raw_value)
+
+    key = value.lower()
+    if category_id:
+        candidates = resolver["subcategory_name_by_category"].get((category_id, key), set())
+    else:
+        candidates = resolver["subcategory_name_to_ids"].get(key, set())
+    resolved = _single_candidate_or_error(candidates, "subcategory", raw_value)
+    logger.info("Deprecated subcategory lookup by name used: %s", raw_value)
+    return resolved
+
+
+def _resolve_tag_id(
+    raw_value: str,
+    resolver: dict[str, Any],
+    category_id: str | None = None,
+    subcategory_id: str | None = None,
+) -> str:
+    value = str(raw_value).strip()
+    if not value:
+        raise ValueError("tag cannot be empty")
+
+    def _apply_scope(candidates: set[str]) -> set[str]:
+        scoped = set(candidates)
+        if subcategory_id:
+            scoped = {
+                item
+                for item in scoped
+                if resolver["tag_meta"][item]["subcategory_id"] == subcategory_id
+            }
+        elif category_id:
+            scoped = {
+                item
+                for item in scoped
+                if resolver["tag_meta"][item]["category_id"] == category_id
+            }
+        return scoped
+
+    if is_uuid(value):
+        key = str(uuid.UUID(value))
+        if key not in resolver["tags_by_id"]:
+            raise ValueError(f"Unknown tag '{raw_value}'.")
+        if _apply_scope({key}) != {key}:
+            raise ValueError("tag does not belong to selected category/subcategory")
+        return key
+
+    slug = slugify(value)
+    candidates = _apply_scope(resolver["tag_slug_to_ids"].get(slug, set()))
+    if candidates:
+        return _single_candidate_or_error(candidates, "tag", raw_value)
+
+    name_key = value.lower()
+    if subcategory_id:
+        candidates = resolver["tag_name_by_subcategory"].get((subcategory_id, name_key), set())
+    else:
+        candidates = resolver["tag_name_to_ids"].get(name_key, set())
+    candidates = _apply_scope(candidates)
+    resolved = _single_candidate_or_error(candidates, "tag", raw_value)
+    logger.info("Deprecated tag lookup by name used: %s", raw_value)
+    return resolved
+
+
+def resolve_taxonomy_filters(
+    taxonomy_payload: dict[str, Any],
+    category_raw: str | None,
+    subcategory_raw: str | None,
+    tag_raw: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    resolver = taxonomy_payload["resolver"]
+
+    category_id: str | None = None
+    subcategory_id: str | None = None
+    tag_id: str | None = None
+
+    if category_raw:
+        category_id = _resolve_category_id(category_raw, resolver)
+    if subcategory_raw:
+        subcategory_id = _resolve_subcategory_id(subcategory_raw, resolver, category_id)
+        if category_id is None and subcategory_id:
+            category_id = resolver["subcategory_meta"][subcategory_id]["category_id"]
+    if tag_raw:
+        tag_id = _resolve_tag_id(tag_raw, resolver, category_id, subcategory_id)
+        tag_info = resolver["tag_meta"][tag_id]
+        if subcategory_id and tag_info["subcategory_id"] != subcategory_id:
+            raise ValueError("tag does not belong to selected subcategory")
+        if category_id and tag_info["category_id"] != category_id:
+            raise ValueError("tag does not belong to selected category")
+        if subcategory_id is None:
+            subcategory_id = tag_info["subcategory_id"]
+        if category_id is None:
+            category_id = tag_info["category_id"]
+
+    if subcategory_id and category_id:
+        expected_category = resolver["subcategory_meta"][subcategory_id]["category_id"]
+        if expected_category != category_id:
+            raise ValueError("subcategory does not belong to selected category")
+
+    return category_id, subcategory_id, tag_id
+
+
+def get_user_email(cursor, user_id: str) -> str | None:
+    cursor.execute("SELECT email FROM users WHERE id = %s", (user_id,))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return None
+    return str(row[0]).strip().lower()
+
+
 # Initialize pool on startup to fail fast if DB is unreachable
 init_db_pool()
 
@@ -301,6 +799,30 @@ def health():
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+
+@app.route("/api/health/db")
+def health_db():
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1;")
+        cursor.fetchone()
+        return jsonify({"status": "ok", "db": "up"}), 200
+    except Exception as exc:
+        logger.exception("DB health endpoint failed")
+        return jsonify({"status": "degraded", "db": "error", "error": str(exc)}), 503
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                logger.exception("Failed to close cursor in /api/health/db")
+        if connection:
+            release_db_connection(connection)
+
 
 @app.route("/api/test-db")
 def test_db():
@@ -616,19 +1138,28 @@ def list_filters():
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
+        taxonomy_payload = load_taxonomy_cache(cursor)
 
-        cursor.execute(
-            """
-            SELECT DISTINCT category
-            FROM events
-            WHERE category IS NOT NULL
-            ORDER BY category ASC
-            """
-        )
-        categories = [row[0] for row in cursor.fetchall()]
+        if taxonomy_payload:
+            categories = taxonomy_payload["legacy_categories"]
+            tags = taxonomy_payload["legacy_tags"]
+            taxonomy = taxonomy_payload["taxonomy"]
+            taxonomy_version = taxonomy_payload["taxonomy_version"]
+        else:
+            cursor.execute(
+                """
+                SELECT DISTINCT category
+                FROM events
+                WHERE category IS NOT NULL
+                ORDER BY category ASC
+                """
+            )
+            categories = [row[0] for row in cursor.fetchall()]
 
-        cursor.execute("SELECT name FROM tags ORDER BY name ASC")
-        tags = [row[0] for row in cursor.fetchall()]
+            cursor.execute("SELECT DISTINCT name FROM tags WHERE name IS NOT NULL ORDER BY name ASC")
+            tags = [row[0] for row in cursor.fetchall()]
+            taxonomy = {"categories": []}
+            taxonomy_version = "legacy"
 
         cursor.execute(
             """
@@ -663,7 +1194,15 @@ def list_filters():
             )
         cities.sort(key=lambda item: item["name"].lower())
 
-        return jsonify({"tags": tags, "categories": categories, "cities": cities})
+        return jsonify(
+            {
+                "tags": tags,
+                "categories": categories,
+                "cities": cities,
+                "taxonomy_version": taxonomy_version,
+                "taxonomy": taxonomy,
+            }
+        )
     except Exception:
         logger.exception("Failed to fetch filters")
         return jsonify({"error": "Unable to fetch filters"}), 500
@@ -673,175 +1212,257 @@ def list_filters():
         if connection:
             release_db_connection(connection)
 
-@app.route("/api/events")
-def list_events():
+
+@app.route("/api/admin/taxonomy")
+def admin_taxonomy():
     connection = None
     cursor = None
+    user_id, error_response = get_auth_user_id()
+    if error_response:
+        return error_response
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        query = """
-            WITH tag_agg AS (
-                SELECT et.event_id, array_remove(array_agg(DISTINCT t.name), NULL) AS tags
-                FROM event_tags et
-                JOIN tags t ON t.id = et.tag_id
-                GROUP BY et.event_id
-            ),
-            review_agg AS (
-                SELECT event_id, COUNT(*) AS review_count, AVG(rating) AS review_avg
-                FROM reviews
-                GROUP BY event_id
+        email = get_user_email(cursor, user_id)
+        if not email or email not in ADMIN_EMAILS:
+            return jsonify({"error": "Forbidden"}), 403
+
+        payload = load_admin_taxonomy_cache(cursor)
+        if payload is None:
+            return jsonify({"error": "Taxonomy unavailable"}), 503
+        return jsonify(payload)
+    except Exception:
+        logger.exception("Failed to fetch admin taxonomy")
+        return jsonify({"error": "Unable to fetch admin taxonomy"}), 500
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                logger.exception("Failed to close cursor")
+        if connection:
+            release_db_connection(connection)
+
+
+@app.route("/api/events")
+def list_events():
+    category_raw = request.args.get("category")
+    subcategory_raw = request.args.get("subcategory")
+    tag_raw = request.args.get("tag")
+    city = request.args.get("city")
+    search_query = request.args.get("q")
+    date_str = request.args.get("date")
+    target_time_param = request.args.get("time")
+    min_rating = request.args.get("min_rating")
+    sort = request.args.get("sort", "soonest")
+
+    lat_val = None
+    lng_val = None
+    radius_km = None
+
+    lat_param = request.args.get("lat")
+    lng_param = request.args.get("lng")
+    if lat_param or lng_param:
+        if not lat_param or not lng_param:
+            return jsonify({"error": "lat and lng are required together"}), 400
+        try:
+            lat_val = float(lat_param)
+            lng_val = float(lng_param)
+        except ValueError:
+            return jsonify({"error": "lat and lng must be numbers"}), 400
+
+    radius_param = request.args.get("radius_km")
+    if radius_param:
+        if lat_val is None or lng_val is None:
+            return jsonify({"error": "radius_km requires lat and lng"}), 400
+        try:
+            radius_km = float(radius_param)
+        except ValueError:
+            return jsonify({"error": "radius_km must be a number"}), 400
+        if radius_km <= 0:
+            return jsonify({"error": "radius_km must be greater than 0"}), 400
+
+    parsed_date = None
+    if date_str:
+        try:
+            parsed_date = datetime.fromisoformat(date_str).date()
+        except ValueError:
+            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+    parsed_time = None
+    if target_time_param:
+        try:
+            parsed_time = datetime.strptime(target_time_param, "%H:%M").time()
+        except ValueError:
+            return jsonify({"error": "Invalid time. Use HH:MM (24h)."}), 400
+
+    min_rating_val = None
+    if min_rating:
+        try:
+            min_rating_val = float(min_rating)
+        except ValueError:
+            return jsonify({"error": "min_rating must be a number"}), 400
+
+    sort_distance = sort in ("distance", "nearest")
+
+    connection = None
+    cursor = None
+    try:
+        def _fetch_rows(db_cursor):
+            taxonomy_payload = load_taxonomy_cache(db_cursor)
+
+            category_expression = "COALESCE(e.category, c.name)" if taxonomy_payload is not None else "e.category"
+            category_search_expression = (
+                "COALESCE(e.category, c.name, '')"
+                if taxonomy_payload is not None
+                else "COALESCE(e.category, '')"
             )
-            SELECT
-                e.id,
-                e.title,
-                e.category,
-                e.start_time,
-                e.end_time,
-                e.description,
-                e.cover_image_url,
-                e.ticket_url,
-                e.price,
-                e.rating_avg,
-                e.rating_count,
-                l.id AS location_id,
-                l.name AS location_name,
-                l.address AS location_address,
-                l.latitude AS location_latitude,
-                l.longitude AS location_longitude,
-                l.features AS location_features,
-                l.cover_image_url AS location_cover_image_url,
-                l.rating_avg AS location_rating_avg,
-                l.rating_count AS location_rating_count,
-                COALESCE(ta.tags, '{}') AS tags,
-                ra.review_avg,
-                ra.review_count
-            FROM events e
-            LEFT JOIN locations l ON e.location_id = l.id
-            LEFT JOIN tag_agg ta ON ta.event_id = e.id
-            LEFT JOIN review_agg ra ON ra.event_id = e.id
-            WHERE 1=1
-        """
+            category_join = "LEFT JOIN categories c ON c.id = e.category_id" if taxonomy_payload is not None else ""
 
-        filters = []
-        params = []
-        lat_val = None
-        lng_val = None
-        radius_km = None
+            query = f"""
+                WITH tag_agg AS (
+                    SELECT
+                        et.event_id,
+                        array_remove(
+                            array_agg(DISTINCT COALESCE(NULLIF(t.name, ''), t.slug)),
+                            NULL
+                        ) AS tags
+                    FROM event_tags et
+                    JOIN tags t ON t.id = et.tag_id
+                    GROUP BY et.event_id
+                ),
+                review_agg AS (
+                    SELECT event_id, COUNT(*) AS review_count, AVG(rating) AS review_avg
+                    FROM reviews
+                    GROUP BY event_id
+                )
+                SELECT
+                    e.id,
+                    e.title,
+                    {category_expression} AS category,
+                    e.start_time,
+                    e.end_time,
+                    e.description,
+                    e.cover_image_url,
+                    e.ticket_url,
+                    e.price,
+                    e.rating_avg,
+                    e.rating_count,
+                    l.id AS location_id,
+                    l.name AS location_name,
+                    l.address AS location_address,
+                    l.latitude AS location_latitude,
+                    l.longitude AS location_longitude,
+                    l.features AS location_features,
+                    l.cover_image_url AS location_cover_image_url,
+                    l.rating_avg AS location_rating_avg,
+                    l.rating_count AS location_rating_count,
+                    COALESCE(ta.tags, '{{}}') AS tags,
+                    ra.review_avg,
+                    ra.review_count
+                FROM events e
+                {category_join}
+                LEFT JOIN locations l ON e.location_id = l.id
+                LEFT JOIN tag_agg ta ON ta.event_id = e.id
+                LEFT JOIN review_agg ra ON ra.event_id = e.id
+                WHERE 1=1
+            """
 
-        lat_param = request.args.get("lat")
-        lng_param = request.args.get("lng")
-        if lat_param or lng_param:
-            if not lat_param or not lng_param:
-                return jsonify({"error": "lat and lng are required together"}), 400
-            try:
-                lat_val = float(lat_param)
-                lng_val = float(lng_param)
-            except ValueError:
-                return jsonify({"error": "lat and lng must be numbers"}), 400
+            filters: list[str] = []
+            params: list[Any] = []
 
-        radius_param = request.args.get("radius_km")
-        if radius_param:
-            if lat_val is None or lng_val is None:
-                return jsonify({"error": "radius_km requires lat and lng"}), 400
-            try:
-                radius_km = float(radius_param)
-            except ValueError:
-                return jsonify({"error": "radius_km must be a number"}), 400
-            if radius_km <= 0:
-                return jsonify({"error": "radius_km must be greater than 0"}), 400
+            if taxonomy_payload is not None and (category_raw or subcategory_raw or tag_raw):
+                category_id, subcategory_id, tag_id = resolve_taxonomy_filters(
+                    taxonomy_payload,
+                    category_raw,
+                    subcategory_raw,
+                    tag_raw,
+                )
+                if category_id:
+                    filters.append("e.category_id = %s")
+                    params.append(category_id)
+                if subcategory_id:
+                    filters.append("e.subcategory_id = %s")
+                    params.append(subcategory_id)
+                if tag_id:
+                    filters.append(
+                        "EXISTS (SELECT 1 FROM event_tags etf WHERE etf.event_id = e.id AND etf.tag_id = %s)"
+                    )
+                    params.append(tag_id)
+            else:
+                if subcategory_raw:
+                    raise ValueError("subcategory filtering requires migrated taxonomy data")
+                if category_raw:
+                    filters.append(f"{category_search_expression} ILIKE %s")
+                    params.append(f"%{category_raw}%")
+                if tag_raw:
+                    filters.append("%s = ANY(COALESCE(ta.tags, '{}'))")
+                    params.append(tag_raw)
 
-        category = request.args.get("category")
-        if category:
-            filters.append("e.category ILIKE %s")
-            params.append(f"%{category}%")
+            if city:
+                filters.append("COALESCE(l.address, '') ILIKE %s")
+                params.append(f"%{city}%")
 
-        tag = request.args.get("tag")
-        if tag:
-            filters.append("%s = ANY(COALESCE(ta.tags, '{}'))")
-            params.append(tag)
+            if search_query:
+                term = f"%{search_query}%"
+                filters.append(
+                    "("
+                    "e.title ILIKE %s OR "
+                    "e.description ILIKE %s OR "
+                    f"{category_search_expression} ILIKE %s OR "
+                    "COALESCE(l.name, '') ILIKE %s OR "
+                    "COALESCE(l.address, '') ILIKE %s OR "
+                    "array_to_string(COALESCE(ta.tags, '{}'), ' ') ILIKE %s"
+                    ")"
+                )
+                params.extend([term, term, term, term, term, term])
 
-        city = request.args.get("city")
-        if city:
-            filters.append("COALESCE(l.address, '') ILIKE %s")
-            params.append(f"%{city}%")
-
-        search_query = request.args.get("q")
-        if search_query:
-            term = f"%{search_query}%"
-            filters.append(
-                "("
-                "e.title ILIKE %s OR "
-                "e.description ILIKE %s OR "
-                "e.category ILIKE %s OR "
-                "COALESCE(l.name, '') ILIKE %s OR "
-                "COALESCE(l.address, '') ILIKE %s OR "
-                "array_to_string(COALESCE(ta.tags, '{}'), ' ') ILIKE %s"
-                ")"
-            )
-            params.extend([term, term, term, term, term, term])
-
-        date_str = request.args.get("date")
-        if date_str:
-            try:
-                parsed = datetime.fromisoformat(date_str).date()
+            if parsed_date:
                 filters.append("DATE(e.start_time) = %s")
-                params.append(parsed)
-            except ValueError:
-                return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+                params.append(parsed_date)
 
-        target_time_param = request.args.get("time")
-        if target_time_param:
-            try:
-                target_t = datetime.strptime(target_time_param, "%H:%M").time()
+            if parsed_time:
                 filters.append("CAST(e.start_time AS time) <= %s AND CAST(e.end_time AS time) >= %s")
-                params.extend([target_t, target_t])
-            except ValueError:
-                return jsonify({"error": "Invalid time. Use HH:MM (24h)."}), 400
+                params.extend([parsed_time, parsed_time])
 
-        min_rating = request.args.get("min_rating")
-        if min_rating:
-            try:
-                min_rating_val = float(min_rating)
+            if min_rating_val is not None:
                 filters.append("COALESCE(ra.review_avg, e.rating_avg) >= %s")
                 params.append(min_rating_val)
-            except ValueError:
-                return jsonify({"error": "min_rating must be a number"}), 400
 
-        if filters:
-            query += " AND " + " AND ".join(filters)
+            if filters:
+                query += " AND " + " AND ".join(filters)
 
-        sort = request.args.get("sort", "soonest")
-        sort_distance = sort in ("distance", "nearest")
-        if sort_distance:
-            query += " ORDER BY e.start_time ASC"
-        elif sort == "toprated":
-            query += " ORDER BY COALESCE(ra.review_avg, e.rating_avg) DESC NULLS LAST, e.start_time ASC"
-        elif sort == "price":
-            query += " ORDER BY e.price ASC NULLS LAST, e.start_time ASC"
-        else:
-            query += " ORDER BY e.start_time ASC"
+            if sort_distance:
+                query += " ORDER BY e.start_time ASC"
+            elif sort == "toprated":
+                query += " ORDER BY COALESCE(ra.review_avg, e.rating_avg) DESC NULLS LAST, e.start_time ASC"
+            elif sort == "price":
+                query += " ORDER BY e.price ASC NULLS LAST, e.start_time ASC"
+            else:
+                query += " ORDER BY e.start_time ASC"
 
+            db_cursor.execute(query, tuple(params))
+            return db_cursor.fetchall()
+
+        connection = get_db_connection()
+        cursor = connection.cursor()
         try:
-            connection = get_db_connection()
-            cursor = connection.cursor()
-            cursor.execute(query, tuple(params))
-            rows = cursor.fetchall()
+            rows = _fetch_rows(cursor)
         except (OperationalError, InterfaceError, PoolError):
             logger.exception("DB error while fetching events, retrying once with fresh pool")
-            if cursor:
-                try:
-                    cursor.close()
-                except Exception:
-                    pass
-            if connection:
-                release_db_connection(connection)
+            try:
+                cursor.close()
+            except Exception:
+                logger.exception("Failed to close cursor after event query failure")
+            release_db_connection(connection)
+            connection = None
+            cursor = None
+
             reset_db_pool()
             connection = get_db_connection()
             cursor = connection.cursor()
-            cursor.execute(query, tuple(params))
-            rows = cursor.fetchall()
+            rows = _fetch_rows(cursor)
 
         events = []
         for row in rows:
@@ -929,6 +1550,8 @@ def list_events():
             )
 
         return jsonify({"events": events})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except PoolError:
         logger.exception("Connection pool unavailable while fetching events")
         return jsonify({"error": "Database unavailable, please retry"}), 503

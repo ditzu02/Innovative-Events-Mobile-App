@@ -9,7 +9,7 @@ client/node_modules
 client/.expo
 client/.expo-shared
 client/dist
-client/.expo-env.d.ts
+client/expo-env.d.ts
 client/.env
 
 # Logs and coverage
@@ -31,3 +31,6 @@ server/.ruff_cache
 # IDE/editor
 .idea
 .vscode
+
+# Local planning notes
+Hierarchical Tags Makeover (Additive, Minimal-Change) — Executable Plan.md

@@ -1,5 +1,5 @@
 -- Enable UUID generation
-create extension if not exists "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -----------------------------------
 -- LOCATIONS TABLE
@@ -18,6 +18,28 @@ CREATE TABLE IF NOT EXISTS locations (
 );
 
 -----------------------------------
+-- CATEGORIES TABLE (L1)
+-----------------------------------
+CREATE TABLE IF NOT EXISTS categories (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    icon TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-----------------------------------
+-- SUBCATEGORIES TABLE (L2)
+-----------------------------------
+CREATE TABLE IF NOT EXISTS subcategories (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    slug TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-----------------------------------
 -- EVENTS TABLE
 -----------------------------------
 CREATE TABLE IF NOT EXISTS events (
@@ -25,6 +47,8 @@ CREATE TABLE IF NOT EXISTS events (
     location_id UUID REFERENCES locations(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     category TEXT,
+    category_id UUID REFERENCES categories(id),
+    subcategory_id UUID REFERENCES subcategories(id),
     start_time TIMESTAMPTZ NOT NULL,
     end_time TIMESTAMPTZ NOT NULL,
     description TEXT,
@@ -83,11 +107,14 @@ CREATE TABLE IF NOT EXISTS event_artists (
 );
 
 -----------------------------------
--- TAGS TABLE
+-- TAGS TABLE (L3)
 -----------------------------------
 CREATE TABLE IF NOT EXISTS tags (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT UNIQUE NOT NULL
+    subcategory_id UUID REFERENCES subcategories(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    slug TEXT UNIQUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -----------------------------------
@@ -130,3 +157,98 @@ CREATE TABLE IF NOT EXISTS event_photos (
     event_id UUID REFERENCES events(id) ON DELETE CASCADE,
     photo_url TEXT NOT NULL
 );
+
+-----------------------------------
+-- TAXONOMY MIGRATION AUDIT
+-----------------------------------
+CREATE TABLE IF NOT EXISTS taxonomy_migration_audit (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID,
+    legacy_tag TEXT,
+    mapped_tag_id UUID,
+    chosen_category_slug TEXT,
+    chosen_subcategory_slug TEXT,
+    reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-----------------------------------
+-- TAXONOMY CONSISTENCY FUNCTIONS / TRIGGERS
+-----------------------------------
+CREATE OR REPLACE FUNCTION validate_event_branch_consistency()
+RETURNS trigger AS $$
+DECLARE
+    subcategory_category_id UUID;
+BEGIN
+    IF NEW.subcategory_id IS NULL OR NEW.category_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT sc.category_id
+    INTO subcategory_category_id
+    FROM subcategories sc
+    WHERE sc.id = NEW.subcategory_id;
+
+    IF subcategory_category_id IS NULL THEN
+        RAISE EXCEPTION 'Invalid subcategory_id % for event %', NEW.subcategory_id, NEW.id
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF subcategory_category_id <> NEW.category_id THEN
+        RAISE EXCEPTION 'Event category_id (%) does not match subcategory category_id (%)',
+            NEW.category_id, subcategory_category_id
+            USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_validate_event_branch_consistency ON events;
+CREATE TRIGGER trg_validate_event_branch_consistency
+BEFORE INSERT OR UPDATE ON events
+FOR EACH ROW
+EXECUTE FUNCTION validate_event_branch_consistency();
+
+CREATE OR REPLACE FUNCTION validate_event_tag_branch_consistency()
+RETURNS trigger AS $$
+DECLARE
+    event_subcategory_id UUID;
+    tag_subcategory_id UUID;
+BEGIN
+    SELECT e.subcategory_id INTO event_subcategory_id
+    FROM events e
+    WHERE e.id = NEW.event_id;
+
+    SELECT t.subcategory_id INTO tag_subcategory_id
+    FROM tags t
+    WHERE t.id = NEW.tag_id;
+
+    IF event_subcategory_id IS NULL OR tag_subcategory_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF event_subcategory_id <> tag_subcategory_id THEN
+        RAISE EXCEPTION 'tag_id % belongs to subcategory %, but event_id % belongs to subcategory %',
+            NEW.tag_id, tag_subcategory_id, NEW.event_id, event_subcategory_id
+            USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_validate_event_tag_branch_consistency ON event_tags;
+CREATE TRIGGER trg_validate_event_tag_branch_consistency
+BEFORE INSERT OR UPDATE ON event_tags
+FOR EACH ROW
+EXECUTE FUNCTION validate_event_tag_branch_consistency();
+
+-----------------------------------
+-- INDEXES
+-----------------------------------
+CREATE INDEX IF NOT EXISTS idx_tags_subcategory ON tags(subcategory_id);
+CREATE INDEX IF NOT EXISTS idx_subcategories_category ON subcategories(category_id);
+CREATE INDEX IF NOT EXISTS idx_event_tags_event ON event_tags(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_tags_tag_event ON event_tags(tag_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_events_category_subcategory ON events(category_id, subcategory_id);
