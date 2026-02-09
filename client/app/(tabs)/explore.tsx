@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Dimensions,
   FlatList,
+  LayoutAnimation,
   Modal,
   Platform,
   Pressable,
@@ -11,16 +12,23 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  UIManager,
   View,
 } from "react-native";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import Slider from "@react-native-community/slider";
-import MapView, { Callout, Marker, PROVIDER_GOOGLE, Region } from "react-native-maps";
+import MapView, { Region } from "react-native-maps";
 import { useRouter } from "expo-router";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import * as Haptics from "expo-haptics";
 
 import { CategoryRail, RailCategoryKey, RailChip } from "@/components/CategoryRail";
+import { EventMap, EventMapEvent } from "@/components/EventMap";
 import { EventCard, EventCardViewModel } from "@/components/EventCard";
+import { ForYouMiniCard } from "@/components/ForYouMiniCard";
+import { useAuth } from "@/context/auth";
+import { SavedEventSummary, useSaved } from "@/context/saved";
+import { loadDiscoverPrefs, PersistedQuickFilters, saveDiscoverPrefs } from "@/lib/demo-prefs";
 import {
   applyClientSideFilters,
   AudienceSegment,
@@ -40,13 +48,22 @@ import {
   pickTopTags,
 } from "@/lib/event-formatting";
 import { request } from "@/lib/api";
+import {
+  getReasonLabel,
+  loadTasteProfile,
+  persistTasteProfile,
+  scoreEventForYou,
+  TasteInteraction,
+  TasteProfile,
+  updateTasteProfileFromInteraction,
+} from "@/lib/taste-profile";
 
 type Event = {
   id: string;
   title: string;
   category: string | null;
-  start_time: string;
-  end_time: string;
+  start_time: string | null;
+  end_time: string | null;
   description?: string | null;
   cover_image_url?: string | null;
   location?: {
@@ -80,6 +97,38 @@ type Option = {
 
 type DiscoverCardViewModel = EventCardViewModel & { event: Event };
 
+type SortMode = "soonest" | "toprated" | "distance" | "price";
+
+type SortChip = {
+  key: SortMode;
+  label: string;
+};
+
+type QuickFilterKey = keyof PersistedQuickFilters;
+
+type ActiveFilterChip = {
+  key: string;
+  label: string;
+};
+
+type ForYouItem = {
+  model: DiscoverCardViewModel;
+  reasonLabel: string;
+  score: number;
+};
+
+type MapMarkerModel = EventMapEvent & {
+  event: Event;
+};
+
+type SelectedMarkerAnchor = {
+  id: string;
+  coordinate: {
+    latitude: number;
+    longitude: number;
+  };
+};
+
 const FALLBACK_TAG_OPTIONS = ["Rock", "Jazz", "Outdoor", "Dj", "Live", "Electronic"];
 const FALLBACK_CATEGORY_OPTIONS = ["Music", "Party", "Art"];
 const RADIUS_OPTIONS = [5, 10, 25, 50];
@@ -89,6 +138,15 @@ const DEFAULT_REGION: Region = {
   latitudeDelta: 0.2,
   longitudeDelta: 0.2,
 };
+const CTA_FALLBACK_HEIGHT = 60;
+const SHEET_FALLBACK_HEIGHT = 136;
+const BOTTOM_GAP = 12;
+const CAMERA_TOP_PADDING = 80;
+const CAMERA_SIDE_PADDING = 40;
+const CAMERA_BOTTOM_BUFFER = 120;
+const MAP_MARKER_LIMIT = 10;
+const CATEGORY_DEBOUNCE_MS = 180;
+const MAP_FIT_EDGE_PADDING = { top: 88, right: 64, bottom: 96, left: 64 };
 const PRICE_OPTIONS: Option[] = [
   { label: "Any", value: "any" },
   { label: "Free", value: "free" },
@@ -112,7 +170,6 @@ const PALETTE = {
   accentSoft: "#2b2446",
   danger: "#ff6b6b",
 };
-const USER_PIN_COLOR = PALETTE.accent;
 const RAIL_CATEGORY_CONFIG: {
   key: Exclude<RailCategoryKey, "all">;
   label: string;
@@ -124,6 +181,42 @@ const RAIL_CATEGORY_CONFIG: {
   { key: "arts", label: "Arts", aliases: ["arts", "arts-culture"] },
   { key: "outdoor", label: "Outdoor", aliases: ["outdoor"] },
 ];
+const SORT_CHIPS: SortChip[] = [
+  { key: "soonest", label: "Soonest" },
+  { key: "toprated", label: "Top Rated" },
+  { key: "distance", label: "Nearest" },
+  { key: "price", label: "Price" },
+];
+const DEFAULT_QUICK_FILTERS: PersistedQuickFilters = {
+  free: false,
+  tonight: false,
+  highRated: false,
+};
+const VIBE_OPTIONS: { label: string; value: Exclude<RailCategoryKey, "all"> }[] = [
+  { label: "Music", value: "music" },
+  { label: "Food", value: "food" },
+  { label: "Nightlife", value: "nightlife" },
+  { label: "Arts", value: "arts" },
+  { label: "Outdoor", value: "outdoor" },
+];
+const EMPTY_TASTE_PROFILE: TasteProfile = {
+  categoryCounts: {},
+  tagCounts: {},
+  updatedAt: 0,
+};
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebounced(value);
+    }, delayMs);
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+
+  return debounced;
+}
 
 function slugifyLabel(value: string) {
   return value
@@ -179,7 +272,9 @@ function filtersEqual(a: DiscoverFilters, b: DiscoverFilters) {
 }
 
 function getPlaceholderToken(category: string | null, title: string): string {
-  const source = category?.trim() || title.trim();
+  const safeCategory = typeof category === "string" ? category.trim() : "";
+  const safeTitle = typeof title === "string" ? title.trim() : "";
+  const source = safeCategory || safeTitle;
   if (!source) return "EV";
   const match = source.match(/[A-Za-z0-9]/);
   return (match?.[0] ?? "E").toUpperCase();
@@ -187,7 +282,7 @@ function getPlaceholderToken(category: string | null, title: string): string {
 
 function getStatusLabel(
   status: Exclude<EventStatus, "ENDED">,
-  startTime: string,
+  startTime: string | null | undefined,
   now: Date
 ): string | null {
   if (status === "LIVE") {
@@ -195,6 +290,9 @@ function getStatusLabel(
   }
 
   if (status === "SOON") {
+    if (!startTime) {
+      return "Starts Soon";
+    }
     const start = new Date(startTime);
     if (Number.isNaN(start.getTime())) {
       return "Starts Soon";
@@ -223,8 +321,127 @@ function hasValidCoordinate<T extends CoordinateLike>(
   return true;
 }
 
+function eventTimestamp(value: string | null | undefined): number {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return Number.POSITIVE_INFINITY;
+  return parsed.getTime();
+}
+
+function sanitizeString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function sanitizeNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value;
+}
+
+function sanitizeEvent(value: unknown): Event | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const input = value as Record<string, unknown>;
+  const id = sanitizeString(input.id);
+  if (!id) return null;
+
+  const title = sanitizeString(input.title) ?? "Untitled event";
+  const category = sanitizeString(input.category);
+  const start_time = sanitizeString(input.start_time);
+  const end_time = sanitizeString(input.end_time);
+  const description = sanitizeString(input.description);
+  const cover_image_url = sanitizeString(input.cover_image_url);
+  const price = sanitizeNumber(input.price);
+  const rating_avg = sanitizeNumber(input.rating_avg);
+  const rating_count = sanitizeNumber(input.rating_count);
+  const latitude = sanitizeNumber(input.latitude);
+  const longitude = sanitizeNumber(input.longitude);
+  const distance_km = sanitizeNumber(input.distance_km);
+
+  const tags = Array.isArray(input.tags)
+    ? input.tags
+      .map((tag) => sanitizeString(tag))
+      .filter((tag): tag is string => Boolean(tag))
+    : [];
+
+  let location: Event["location"] = null;
+  if (input.location && typeof input.location === "object" && !Array.isArray(input.location)) {
+    const rawLocation = input.location as Record<string, unknown>;
+    location = {
+      name: sanitizeString(rawLocation.name),
+      address: sanitizeString(rawLocation.address),
+      features: rawLocation.features,
+    };
+  }
+
+  return {
+    id,
+    title,
+    category,
+    start_time,
+    end_time,
+    description,
+    cover_image_url,
+    location,
+    price,
+    rating_avg,
+    rating_count,
+    tags,
+    latitude,
+    longitude,
+    distance_km,
+  };
+}
+
+function sanitizeEventsPayload(value: unknown): Event[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((event) => sanitizeEvent(event))
+    .filter((event): event is Event => Boolean(event));
+}
+
+function isSameLocalDay(date: Date, reference: Date): boolean {
+  return (
+    date.getFullYear() === reference.getFullYear() &&
+    date.getMonth() === reference.getMonth() &&
+    date.getDate() === reference.getDate()
+  );
+}
+
+function toSavedSummary(event: Event): SavedEventSummary {
+  return {
+    id: event.id,
+    title: event.title,
+    category: event.category,
+    start_time: event.start_time ?? null,
+    end_time: event.end_time ?? null,
+    description: event.description ?? null,
+    cover_image_url: event.cover_image_url ?? null,
+    location: event.location ?? null,
+    price: event.price ?? null,
+    rating_avg: event.rating_avg ?? null,
+    rating_count: event.rating_count ?? null,
+    tags: event.tags ?? [],
+    latitude: event.latitude ?? null,
+    longitude: event.longitude ?? null,
+    distance_km: event.distance_km ?? null,
+  };
+}
+
+function isRailCategoryKey(value: string): value is RailCategoryKey {
+  return value === "all" || value === "music" || value === "food" || value === "nightlife" || value === "arts" || value === "outdoor";
+}
+
 export default function DiscoverScreen() {
+  const insets = useSafeAreaInsets();
   const router = useRouter();
+  const { isAuthed } = useAuth();
+  const { isEventSaved, pendingSaveIds, toggleSave } = useSaved();
 
   const [events, setEvents] = useState<Event[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -243,10 +460,14 @@ export default function DiscoverScreen() {
 
   const [mapExpanded, setMapExpanded] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null);
+  const [selectedMarkerAnchor, setSelectedMarkerAnchor] = useState<SelectedMarkerAnchor | null>(null);
   const [pendingNavId, setPendingNavId] = useState<string | null>(null);
   const [showListOverlay, setShowListOverlay] = useState(false);
   const [mapRegion, setMapRegion] = useState<Region>(DEFAULT_REGION);
-  const [mapReady, setMapReady] = useState(false);
+  const [expandedMapMounted, setExpandedMapMounted] = useState(false);
+  const [expandedMapReady, setExpandedMapReady] = useState(false);
+  const [ctaHeight, setCtaHeight] = useState(CTA_FALLBACK_HEIGHT);
+  const [selectedCardHeight, setSelectedCardHeight] = useState(SHEET_FALLBACK_HEIGHT);
   const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null);
 
   const [taxonomyCategories, setTaxonomyCategories] = useState<TaxonomyCategory[] | null>(null);
@@ -262,8 +483,14 @@ export default function DiscoverScreen() {
   const [selectedRailCategory, setSelectedRailCategory] = useState<RailCategoryKey>("all");
   const [railNotice, setRailNotice] = useState<string | null>(null);
   const [clockTick, setClockTick] = useState<number>(() => Date.now());
+  const [sortMode, setSortMode] = useState<SortMode>("soonest");
+  const [quickFilters, setQuickFilters] = useState<PersistedQuickFilters>(DEFAULT_QUICK_FILTERS);
+  const [tasteProfile, setTasteProfile] = useState<TasteProfile>(EMPTY_TASTE_PROFILE);
+  const [prefsHydrated, setPrefsHydrated] = useState(false);
 
   const mapRef = useRef<MapView | null>(null);
+  const expandedMapMountTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSelectionCameraKeyRef = useRef<string | null>(null);
   const mapRegionRef = useRef<Region>(DEFAULT_REGION);
   const hasAutoCenteredRef = useRef(false);
   const selectedRailCategoryRef = useRef<RailCategoryKey>("all");
@@ -271,6 +498,8 @@ export default function DiscoverScreen() {
   const activeFetchSeqRef = useRef(0);
   const eventsAbortRef = useRef<AbortController | null>(null);
   const lastSuccessfulEventsRef = useRef<Event[] | null>(null);
+  const mountedRef = useRef(true);
+  const layoutAnimationReadyRef = useRef(Platform.OS !== "android");
 
   const taxonomyEnabled = !!taxonomyCategories?.length;
 
@@ -379,13 +608,16 @@ export default function DiscoverScreen() {
     }
     return fallbackTagById.get(appliedFilters.tagId)?.slug ?? null;
   }, [appliedFilters.tagId, taxonomyEnabled, hierarchyTagById, fallbackTagById]);
+  const debouncedAppliedCategorySlug = useDebouncedValue(appliedCategorySlug, CATEGORY_DEBOUNCE_MS);
+  const debouncedAppliedSubcategorySlug = useDebouncedValue(appliedSubcategorySlug, CATEGORY_DEBOUNCE_MS);
+  const debouncedAppliedTagSlug = useDebouncedValue(appliedTagSlug, CATEGORY_DEBOUNCE_MS);
 
   const displayEvents = useMemo(
     () => applyClientSideFilters(events ?? [], appliedFilters),
     [events, appliedFilters]
   );
 
-  const cardViewModels = useMemo<DiscoverCardViewModel[]>(() => {
+  const baseCardViewModels = useMemo<DiscoverCardViewModel[]>(() => {
     const now = new Date(clockTick);
 
     return displayEvents.flatMap((event) => {
@@ -420,20 +652,348 @@ export default function DiscoverScreen() {
     });
   }, [displayEvents, clockTick]);
 
+  const filteredCardViewModels = useMemo(() => {
+    const now = new Date(clockTick);
+    const tonightThreshold = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 18, 0, 0, 0);
+
+    return baseCardViewModels.filter((item) => {
+      if (quickFilters.free && item.event.price !== 0) {
+        return false;
+      }
+      if (quickFilters.highRated && (item.event.rating_avg ?? 0) < 4.5) {
+        return false;
+      }
+      if (quickFilters.tonight) {
+        if (!item.event.start_time) return false;
+        const start = new Date(item.event.start_time);
+        if (Number.isNaN(start.getTime())) return false;
+        if (!isSameLocalDay(start, now)) return false;
+        if (start.getTime() < tonightThreshold.getTime()) return false;
+      }
+      return true;
+    });
+  }, [baseCardViewModels, clockTick, quickFilters]);
+
+  const sortedCardViewModels = useMemo<DiscoverCardViewModel[]>(() => {
+    const next = [...filteredCardViewModels];
+
+    if (sortMode === "toprated") {
+      next.sort((a, b) => {
+        const ratingDiff = (b.event.rating_avg ?? -1) - (a.event.rating_avg ?? -1);
+        if (ratingDiff !== 0) return ratingDiff;
+        const countDiff = (b.event.rating_count ?? -1) - (a.event.rating_count ?? -1);
+        if (countDiff !== 0) return countDiff;
+        return eventTimestamp(a.event.start_time) - eventTimestamp(b.event.start_time);
+      });
+      return next;
+    }
+
+    if (sortMode === "distance") {
+      next.sort((a, b) => {
+        const aDistance = a.event.distance_km ?? Number.POSITIVE_INFINITY;
+        const bDistance = b.event.distance_km ?? Number.POSITIVE_INFINITY;
+        if (aDistance !== bDistance) return aDistance - bDistance;
+        return eventTimestamp(a.event.start_time) - eventTimestamp(b.event.start_time);
+      });
+      return next;
+    }
+
+    if (sortMode === "price") {
+      next.sort((a, b) => {
+        const aPrice = a.event.price ?? Number.POSITIVE_INFINITY;
+        const bPrice = b.event.price ?? Number.POSITIVE_INFINITY;
+        if (aPrice !== bPrice) return aPrice - bPrice;
+        return eventTimestamp(a.event.start_time) - eventTimestamp(b.event.start_time);
+      });
+      return next;
+    }
+
+    next.sort((a, b) => eventTimestamp(a.event.start_time) - eventTimestamp(b.event.start_time));
+    return next;
+  }, [filteredCardViewModels, sortMode]);
+
+  const hasTasteSignals = useMemo(() => {
+    return (
+      Object.keys(tasteProfile.categoryCounts).length > 0 ||
+      Object.keys(tasteProfile.tagCounts).length > 0 ||
+      Boolean(tasteProfile.seededVibe)
+    );
+  }, [tasteProfile]);
+
+  const forYouItems = useMemo<ForYouItem[]>(() => {
+    const now = new Date(clockTick);
+    return filteredCardViewModels
+      .map((model) => {
+        const { score, reason } = scoreEventForYou(model.event, tasteProfile, now);
+        return {
+          model,
+          score,
+          reasonLabel: getReasonLabel(reason, {
+            category: model.event.category,
+            vibe: tasteProfile.seededVibe,
+          }),
+        };
+      })
+      .filter((item) => item.score >= 3)
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return eventTimestamp(a.model.event.start_time) - eventTimestamp(b.model.event.start_time);
+      })
+      .slice(0, 8);
+  }, [filteredCardViewModels, tasteProfile, clockTick]);
+
+  const showForYouRail = forYouItems.length >= 3;
+
+  const activeFilterChips = useMemo<ActiveFilterChip[]>(() => {
+    const chips: ActiveFilterChip[] = [];
+    if (appliedFilters.date) chips.push({ key: "date", label: `Date ${appliedFilters.date.toLocaleDateString()}` });
+    if (appliedFilters.categoryId) {
+      chips.push({
+        key: "category",
+        label: `Category ${categoryById.get(appliedFilters.categoryId)?.name ?? "Selected"}`,
+      });
+    }
+    if (appliedFilters.subcategoryId) {
+      chips.push({
+        key: "subcategory",
+        label: `Subcategory ${subcategoryById.get(appliedFilters.subcategoryId)?.name ?? "Selected"}`,
+      });
+    }
+    if (appliedFilters.tagId) {
+      const tagName =
+        hierarchyTagById.get(appliedFilters.tagId)?.name ??
+        fallbackTagById.get(appliedFilters.tagId)?.name ??
+        "Selected";
+      chips.push({ key: "tag", label: `Tag ${tagName}` });
+    }
+    if (appliedFilters.radiusKm != null) chips.push({ key: "radius", label: `Radius ${appliedFilters.radiusKm} km` });
+    if (appliedFilters.priceBand !== "any") {
+      const priceLabel = PRICE_OPTIONS.find((option) => option.value === appliedFilters.priceBand)?.label ?? appliedFilters.priceBand;
+      chips.push({ key: "price", label: `Price ${priceLabel}` });
+    }
+    if (appliedFilters.minRating != null) chips.push({ key: "minRating", label: `Rating ${appliedFilters.minRating}+` });
+    if (appliedFilters.audience) chips.push({ key: "audience", label: `Audience ${appliedFilters.audience}` });
+    if (appliedFilters.venueFeatures.length > 0) {
+      chips.push({ key: "venueFeatures", label: `Venue features (${appliedFilters.venueFeatures.length})` });
+    }
+    if (quickFilters.tonight) chips.push({ key: "tonight", label: "Tonight" });
+    if (quickFilters.highRated) chips.push({ key: "highRated", label: "4.5+" });
+    return chips;
+  }, [
+    appliedFilters,
+    quickFilters,
+    categoryById,
+    subcategoryById,
+    hierarchyTagById,
+    fallbackTagById,
+  ]);
+
   const discoverEvents = useMemo(
-    () => cardViewModels.map((item) => item.event),
-    [cardViewModels]
+    () => sortedCardViewModels.map((item) => item.event),
+    [sortedCardViewModels]
+  );
+  const allMapMarkers = useMemo<MapMarkerModel[]>(
+    () =>
+      discoverEvents.flatMap((event) => {
+        if (!hasValidCoordinate(event)) {
+          return [];
+        }
+        return [
+          {
+            id: event.id,
+            title: event.title,
+            subtitle: event.location?.name ?? "",
+            coordinate: {
+              latitude: event.latitude,
+              longitude: event.longitude,
+            },
+            event,
+          },
+        ];
+      }),
+    [discoverEvents]
+  );
+  const visibleMapMarkers = useMemo(
+    () => allMapMarkers.slice(0, MAP_MARKER_LIMIT),
+    [allMapMarkers]
+  );
+  const visibleMarkerCoordinates = useMemo(
+    () => visibleMapMarkers.map((marker) => marker.coordinate),
+    [visibleMapMarkers]
+  );
+  const visibleMapMarkersSignature = useMemo(
+    () =>
+      visibleMapMarkers
+        .map((marker) => `${marker.id}:${marker.coordinate.latitude.toFixed(5)},${marker.coordinate.longitude.toFixed(5)}`)
+        .join("|"),
+    [visibleMapMarkers]
   );
 
   const venueFeatureOptions = useMemo(() => collectVenueFeatureOptions(events ?? []), [events]);
 
-  const activeFilterCount = useMemo(() => getActiveFilterCount(appliedFilters), [appliedFilters]);
+  const activeFilterCount = useMemo(
+    () => getActiveFilterCount(appliedFilters) + (quickFilters.tonight ? 1 : 0) + (quickFilters.highRated ? 1 : 0),
+    [appliedFilters, quickFilters]
+  );
 
   const hasValidUserLocation = hasValidCoordinate(userLocation);
 
   const locationLabel = hasValidUserLocation
     ? `${userLocation.latitude.toFixed(4)}, ${userLocation.longitude.toFixed(4)}`
     : "Pin not set";
+  const resolvedCtaHeight = Math.max(ctaHeight, CTA_FALLBACK_HEIGHT);
+  const resolvedSheetHeight = Math.max(selectedCardHeight, SHEET_FALLBACK_HEIGHT);
+  const ctaBottomOffset = insets.bottom + (selectedEvent ? resolvedSheetHeight + BOTTOM_GAP : BOTTOM_GAP);
+
+  const runCalmLayout = useCallback(() => {
+    if (!layoutAnimationReadyRef.current) {
+      return;
+    }
+    try {
+      LayoutAnimation.configureNext({
+        duration: 140,
+        update: {
+          type: LayoutAnimation.Types.easeInEaseOut,
+        },
+        create: {
+          type: LayoutAnimation.Types.easeInEaseOut,
+          property: LayoutAnimation.Properties.opacity,
+        },
+        delete: {
+          type: LayoutAnimation.Types.easeInEaseOut,
+          property: LayoutAnimation.Properties.opacity,
+        },
+      });
+    } catch {
+      // Prevent rail interactions from crashing if layout animations are unavailable.
+    }
+  }, []);
+
+  const triggerLightHaptic = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+  }, []);
+
+  const applyTasteInteraction = useCallback((interaction: TasteInteraction) => {
+    setTasteProfile((prev) => {
+      const next = updateTasteProfileFromInteraction(prev, interaction);
+      persistTasteProfile(next).catch(() => undefined);
+      return next;
+    });
+  }, []);
+
+  const handlePickVibe = useCallback((vibe: string) => {
+    runCalmLayout();
+    triggerLightHaptic();
+    applyTasteInteraction({ type: "vibe", vibe });
+  }, [applyTasteInteraction, runCalmLayout, triggerLightHaptic]);
+
+  const handleSelectSortChip = useCallback(
+    (mode: SortMode) => {
+      if (mode === "distance" && !hasValidUserLocation) {
+        setRailNotice("Drop a pin to sort by distance.");
+        setMapExpanded(true);
+        return;
+      }
+      if (sortMode === mode) return;
+      triggerLightHaptic();
+      runCalmLayout();
+      setSortMode(mode);
+    },
+    [hasValidUserLocation, sortMode, runCalmLayout, triggerLightHaptic]
+  );
+
+  const handleToggleQuickFilter = useCallback(
+    (key: QuickFilterKey) => {
+      triggerLightHaptic();
+      runCalmLayout();
+      setQuickFilters((prev) => {
+        const next = { ...prev, [key]: !prev[key] };
+
+        if (key === "free") {
+          setAppliedFilters((current) => ({
+            ...current,
+            priceBand: next.free ? "free" : current.priceBand === "free" ? "any" : current.priceBand,
+          }));
+          setDraftFilters((current) => ({
+            ...current,
+            priceBand: next.free ? "free" : current.priceBand === "free" ? "any" : current.priceBand,
+          }));
+        }
+
+        return next;
+      });
+    },
+    [runCalmLayout, triggerLightHaptic]
+  );
+
+  const clearAllFilters = useCallback(() => {
+    runCalmLayout();
+    setAppliedFilters(cloneFilters(DEFAULT_DISCOVER_FILTERS));
+    setDraftFilters(cloneFilters(DEFAULT_DISCOVER_FILTERS));
+    setQuickFilters({ ...DEFAULT_QUICK_FILTERS });
+    setSelectedRailCategory("all");
+  }, [runCalmLayout]);
+
+  const handleClearActiveChip = useCallback(
+    (chipKey: string) => {
+      runCalmLayout();
+      if (chipKey === "date") {
+        setAppliedFilters((prev) => ({ ...prev, date: null }));
+        setDraftFilters((prev) => ({ ...prev, date: null }));
+        return;
+      }
+      if (chipKey === "category") {
+        setAppliedFilters((prev) => ({ ...prev, categoryId: null, subcategoryId: null, tagId: null }));
+        setDraftFilters((prev) => ({ ...prev, categoryId: null, subcategoryId: null, tagId: null }));
+        setSelectedRailCategory("all");
+        return;
+      }
+      if (chipKey === "subcategory") {
+        setAppliedFilters((prev) => ({ ...prev, subcategoryId: null, tagId: null }));
+        setDraftFilters((prev) => ({ ...prev, subcategoryId: null, tagId: null }));
+        return;
+      }
+      if (chipKey === "tag") {
+        setAppliedFilters((prev) => ({ ...prev, tagId: null }));
+        setDraftFilters((prev) => ({ ...prev, tagId: null }));
+        return;
+      }
+      if (chipKey === "radius") {
+        setAppliedFilters((prev) => ({ ...prev, radiusKm: null }));
+        setDraftFilters((prev) => ({ ...prev, radiusKm: null }));
+        return;
+      }
+      if (chipKey === "price") {
+        setAppliedFilters((prev) => ({ ...prev, priceBand: "any" }));
+        setDraftFilters((prev) => ({ ...prev, priceBand: "any" }));
+        setQuickFilters((prev) => ({ ...prev, free: false }));
+        return;
+      }
+      if (chipKey === "minRating") {
+        setAppliedFilters((prev) => ({ ...prev, minRating: null }));
+        setDraftFilters((prev) => ({ ...prev, minRating: null }));
+        return;
+      }
+      if (chipKey === "audience") {
+        setAppliedFilters((prev) => ({ ...prev, audience: null }));
+        setDraftFilters((prev) => ({ ...prev, audience: null }));
+        return;
+      }
+      if (chipKey === "venueFeatures") {
+        setAppliedFilters((prev) => ({ ...prev, venueFeatures: [] }));
+        setDraftFilters((prev) => ({ ...prev, venueFeatures: [] }));
+        return;
+      }
+      if (chipKey === "tonight") {
+        setQuickFilters((prev) => ({ ...prev, tonight: false }));
+        return;
+      }
+      if (chipKey === "highRated") {
+        setQuickFilters((prev) => ({ ...prev, highRated: false }));
+      }
+    },
+    [runCalmLayout]
+  );
 
   const getPreviewRegion = useCallback(() => {
     if (hasValidUserLocation && userLocation) {
@@ -445,33 +1005,61 @@ export default function DiscoverScreen() {
       };
     }
 
-    const markerSource = discoverEvents.length > 0 ? discoverEvents : [];
-    const firstWithCoords = markerSource.find((event) => hasValidCoordinate(event));
-    if (firstWithCoords) {
+    const firstMarker = visibleMapMarkers[0];
+    if (firstMarker) {
       const current = mapRegionRef.current ?? DEFAULT_REGION;
       return {
-        latitude: firstWithCoords.latitude,
-        longitude: firstWithCoords.longitude,
+        latitude: firstMarker.coordinate.latitude,
+        longitude: firstMarker.coordinate.longitude,
         latitudeDelta: current.latitudeDelta ?? 0.2,
         longitudeDelta: current.longitudeDelta ?? 0.2,
       };
     }
 
     return mapRegionRef.current ?? DEFAULT_REGION;
-  }, [userLocation, hasValidUserLocation, discoverEvents]);
+  }, [userLocation, hasValidUserLocation, visibleMapMarkers]);
 
-  const getTargetRegion = useCallback(() => {
-    const current = mapRegionRef.current ?? DEFAULT_REGION;
-    if (hasValidUserLocation && userLocation) {
-      return {
-        latitude: userLocation.latitude,
-        longitude: userLocation.longitude,
-        latitudeDelta: current.latitudeDelta ?? 0.2,
-        longitudeDelta: current.longitudeDelta ?? 0.2,
-      };
-    }
-    return current;
-  }, [userLocation, hasValidUserLocation]);
+  const fitMapToMarkers = useCallback(
+    (animated: boolean) => {
+      if (!expandedMapReady || !mapRef.current) {
+        return;
+      }
+
+      if (visibleMapMarkers.length === 0) {
+        const fallbackRegion = hasValidUserLocation && userLocation
+          ? {
+            latitude: userLocation.latitude,
+            longitude: userLocation.longitude,
+            latitudeDelta: 0.2,
+            longitudeDelta: 0.2,
+          }
+          : DEFAULT_REGION;
+
+        setMapRegion(fallbackRegion);
+        mapRef.current.animateToRegion(fallbackRegion, animated ? 250 : 0);
+        return;
+      }
+
+      if (visibleMapMarkers.length === 1) {
+        const [singleMarker] = visibleMapMarkers;
+        const singleRegion = {
+          latitude: singleMarker.coordinate.latitude,
+          longitude: singleMarker.coordinate.longitude,
+          latitudeDelta: 0.04,
+          longitudeDelta: 0.04,
+        };
+        setMapRegion(singleRegion);
+        mapRef.current.animateToRegion(singleRegion, animated ? 250 : 0);
+        return;
+      }
+
+      mapRef.current.fitToCoordinates(visibleMarkerCoordinates, {
+        edgePadding: MAP_FIT_EDGE_PADDING,
+        animated,
+      });
+    },
+    [expandedMapReady, visibleMapMarkers, visibleMarkerCoordinates, hasValidUserLocation, userLocation]
+  );
 
   const handleDropPin = useCallback(
     (coordinate: { latitude: number; longitude: number }) => {
@@ -488,11 +1076,40 @@ export default function DiscoverScreen() {
 
       setUserLocation(coordinate);
       setMapRegion(nextRegion);
-      if (mapReady) {
+      if (expandedMapReady) {
         mapRef.current?.animateToRegion(nextRegion, 250);
       }
     },
-    [mapReady]
+    [expandedMapReady]
+  );
+
+  const handleExpandedMapRegionChangeComplete = useCallback(
+    (region: Region) => {
+      if (!expandedMapReady) return;
+      if (
+        !Number.isFinite(region.latitude) ||
+        !Number.isFinite(region.longitude) ||
+        !Number.isFinite(region.latitudeDelta) ||
+        !Number.isFinite(region.longitudeDelta)
+      ) {
+        return;
+      }
+      setMapRegion(region);
+    },
+    [expandedMapReady]
+  );
+
+  const handleMapMarkerPress = useCallback(
+    (marker: EventMapEvent) => {
+      const matched = visibleMapMarkers.find((item) => item.id === marker.id);
+      if (!matched) return;
+      setSelectedEvent(matched.event);
+      setSelectedMarkerAnchor({
+        id: matched.id,
+        coordinate: matched.coordinate,
+      });
+    },
+    [visibleMapMarkers]
   );
 
   const visibleEvents = useMemo(() => {
@@ -526,11 +1143,12 @@ export default function DiscoverScreen() {
     );
   }, [mapRegion, discoverEvents]);
 
-  const handleOpenEvent = useCallback((id: string) => {
+  const handleOpenEvent = useCallback((event: Event) => {
+    applyTasteInteraction({ type: "open", event });
     setSelectedEvent(null);
-    setPendingNavId(id);
+    setPendingNavId(event.id);
     setMapExpanded(false);
-  }, []);
+  }, [applyTasteInteraction]);
 
   const handleOpenFilters = useCallback(() => {
     setDraftFilters((_) => cloneFilters(appliedFilters));
@@ -564,6 +1182,7 @@ export default function DiscoverScreen() {
     }
 
     setRailNotice(null);
+    triggerLightHaptic();
     setSelectedRailCategory(chip.key);
 
     if (!appliedAligned) {
@@ -591,6 +1210,7 @@ export default function DiscoverScreen() {
     draftFilters.subcategoryId,
     draftFilters.tagId,
     selectedRailCategory,
+    triggerLightHaptic,
   ]);
 
   const handleCancelFilters = useCallback(() => {
@@ -600,21 +1220,75 @@ export default function DiscoverScreen() {
   }, [appliedFilters]);
 
   const handleResetDraftFilters = useCallback(() => {
+    runCalmLayout();
     setDraftFilters(cloneFilters(DEFAULT_DISCOVER_FILTERS));
+    setQuickFilters({ ...DEFAULT_QUICK_FILTERS });
     setShowDatePicker(false);
-  }, []);
+  }, [runCalmLayout]);
 
   const handleApplyFilters = useCallback(() => {
+    triggerLightHaptic();
+    runCalmLayout();
     setAppliedFilters((_) => cloneFilters(draftFilters));
+    setQuickFilters((prev) => ({
+      ...prev,
+      free: draftFilters.priceBand === "free",
+    }));
     setShowDatePicker(false);
     setFilterSheetVisible(false);
-  }, [draftFilters]);
+  }, [draftFilters, runCalmLayout, triggerLightHaptic]);
 
   const handleOpenMapFromFilters = useCallback(() => {
     setFilterSheetVisible(false);
     setShowDatePicker(false);
     setMapExpanded(true);
   }, []);
+
+  const handleExpandedMapShow = useCallback(() => {
+    if (expandedMapMountTimerRef.current) {
+      clearTimeout(expandedMapMountTimerRef.current);
+      expandedMapMountTimerRef.current = null;
+    }
+    setExpandedMapMounted(false);
+    setExpandedMapReady(false);
+    expandedMapMountTimerRef.current = setTimeout(() => {
+      if (!mountedRef.current) return;
+      setExpandedMapMounted(true);
+      expandedMapMountTimerRef.current = null;
+    }, 80);
+  }, []);
+
+  const handleOpenEventFromList = useCallback(
+    (event: Event) => {
+      applyTasteInteraction({ type: "open", event });
+      router.push(`/event/${event.id}`);
+    },
+    [applyTasteInteraction, router]
+  );
+
+  const handleToggleSaveEvent = useCallback(
+    async (event: Event) => {
+      if (!isAuthed) {
+        setRailNotice("Sign in to save events.");
+        router.push("/account");
+        return;
+      }
+      try {
+        triggerLightHaptic();
+        const savedNow = await toggleSave(toSavedSummary(event));
+        if (savedNow) {
+          setRailNotice("Saved to your list.");
+          applyTasteInteraction({ type: "save", event });
+        } else {
+          setRailNotice("Removed from saved.");
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unable to update saved events";
+        setRailNotice(message);
+      }
+    },
+    [isAuthed, router, triggerLightHaptic, toggleSave, applyTasteInteraction]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -667,10 +1341,100 @@ export default function DiscoverScreen() {
   }, []);
 
   useEffect(() => {
+    if (Platform.OS !== "android") {
+      layoutAnimationReadyRef.current = true;
+      return;
+    }
+    if (!UIManager.setLayoutAnimationEnabledExperimental) {
+      layoutAnimationReadyRef.current = false;
+      return;
+    }
+    try {
+      UIManager.setLayoutAnimationEnabledExperimental(true);
+      layoutAnimationReadyRef.current = true;
+    } catch {
+      layoutAnimationReadyRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [storedPrefs, storedTaste] = await Promise.all([loadDiscoverPrefs(), loadTasteProfile()]);
+      if (cancelled || !mountedRef.current) return;
+
+      if (storedPrefs) {
+        if (storedPrefs.userLocation) {
+          setUserLocation(storedPrefs.userLocation);
+        }
+        if (isRailCategoryKey(storedPrefs.selectedRailCategory)) {
+          setSelectedRailCategory(storedPrefs.selectedRailCategory);
+        }
+        setSortMode(storedPrefs.sortMode);
+        setQuickFilters(storedPrefs.quickFilters);
+        setAppliedFilters((prev) => ({
+          ...prev,
+          priceBand: storedPrefs.quickFilters.free ? "free" : prev.priceBand,
+          date: storedPrefs.dateIso ? new Date(storedPrefs.dateIso) : prev.date,
+        }));
+        setDraftFilters((prev) => ({
+          ...prev,
+          priceBand: storedPrefs.quickFilters.free ? "free" : prev.priceBand,
+          date: storedPrefs.dateIso ? new Date(storedPrefs.dateIso) : prev.date,
+        }));
+      }
+      setTasteProfile(storedTaste);
+      setPrefsHydrated(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!prefsHydrated) return;
+
+    const timer = setTimeout(() => {
+      saveDiscoverPrefs({
+        sortMode,
+        selectedRailCategory,
+        userLocation,
+        quickFilters,
+        dateIso: appliedFilters.date ? appliedFilters.date.toISOString() : null,
+        updatedAt: Date.now(),
+      }).catch(() => undefined);
+    }, 450);
+
+    return () => clearTimeout(timer);
+  }, [prefsHydrated, sortMode, selectedRailCategory, userLocation, quickFilters, appliedFilters.date]);
+
+  useEffect(() => {
     if (!railNotice) return;
     const timer = setTimeout(() => setRailNotice(null), 2600);
     return () => clearTimeout(timer);
   }, [railNotice]);
+
+  useEffect(() => {
+    if (quickFilters.free && appliedFilters.priceBand !== "free") {
+      setQuickFilters((prev) => ({ ...prev, free: false }));
+    }
+  }, [quickFilters.free, appliedFilters.priceBand]);
+
+  useEffect(() => {
+    if (sortMode !== "distance") return;
+    if (hasValidUserLocation) return;
+    setSortMode("soonest");
+    setRailNotice("Drop a pin to sort by distance.");
+  }, [sortMode, hasValidUserLocation]);
+
+  useEffect(() => {
+    if (!quickFilters.tonight) return;
+    if (events == null || loading) return;
+    if (filteredCardViewModels.length > 0) return;
+    setQuickFilters((prev) => ({ ...prev, tonight: false }));
+    setRailNotice("No events tonight — showing all.");
+  }, [quickFilters.tonight, filteredCardViewModels.length, events, loading]);
 
   useEffect(() => {
     if (!appliedFilters.categoryId) {
@@ -688,11 +1452,35 @@ export default function DiscoverScreen() {
   }, [appliedFilters.categoryId, railCategoryById]);
 
   useEffect(() => {
+    if (selectedRailCategory === "all") return;
+    if (appliedFilters.categoryId) return;
+    const matchedChip = railChips.find((chip) => chip.key === selectedRailCategory);
+    if (!matchedChip?.categoryId) return;
+    setAppliedFilters((prev) => ({
+      ...prev,
+      categoryId: matchedChip.categoryId,
+      subcategoryId: null,
+      tagId: null,
+    }));
+    setDraftFilters((prev) => ({
+      ...prev,
+      categoryId: matchedChip.categoryId,
+      subcategoryId: null,
+      tagId: null,
+    }));
+  }, [selectedRailCategory, appliedFilters.categoryId, railChips]);
+
+  useEffect(() => {
     selectedRailCategoryRef.current = selectedRailCategory;
   }, [selectedRailCategory]);
 
   useEffect(() => {
     return () => {
+      if (expandedMapMountTimerRef.current) {
+        clearTimeout(expandedMapMountTimerRef.current);
+        expandedMapMountTimerRef.current = null;
+      }
+      mountedRef.current = false;
       activeFetchSeqRef.current = fetchSeqRef.current + 1;
       eventsAbortRef.current?.abort();
       eventsAbortRef.current = null;
@@ -704,16 +1492,29 @@ export default function DiscoverScreen() {
   }, [mapRegion]);
 
   useEffect(() => {
-    if (!mapExpanded) {
+    if (mapExpanded) {
       return;
     }
-
-    const target = getTargetRegion();
-    setMapRegion(target);
-    if (mapReady) {
-      mapRef.current?.animateToRegion(target, 250);
+    if (expandedMapMountTimerRef.current) {
+      clearTimeout(expandedMapMountTimerRef.current);
+      expandedMapMountTimerRef.current = null;
     }
-  }, [mapExpanded, getTargetRegion, mapReady]);
+    setExpandedMapMounted(false);
+    setExpandedMapReady(false);
+    setSelectedEvent(null);
+    setSelectedMarkerAnchor(null);
+    lastSelectionCameraKeyRef.current = null;
+  }, [mapExpanded]);
+
+  useEffect(() => {
+    if (!mapExpanded || !expandedMapMounted || !expandedMapReady) {
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      fitMapToMarkers(true);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [mapExpanded, expandedMapMounted, expandedMapReady, visibleMapMarkersSignature, fitMapToMarkers]);
 
   useEffect(() => {
     if (!mapExpanded && pendingNavId) {
@@ -725,18 +1526,57 @@ export default function DiscoverScreen() {
 
   useEffect(() => {
     if (!selectedEvent) return;
-    if (!discoverEvents.some((event) => event.id === selectedEvent.id)) {
+    if (!visibleMapMarkers.some((marker) => marker.id === selectedEvent.id)) {
       setSelectedEvent(null);
     }
-  }, [discoverEvents, selectedEvent]);
+  }, [visibleMapMarkers, selectedEvent]);
+
+  useEffect(() => {
+    if (selectedEvent) return;
+    setSelectedMarkerAnchor(null);
+    lastSelectionCameraKeyRef.current = null;
+  }, [selectedEvent]);
+
+  useEffect(() => {
+    if (!mapExpanded || !expandedMapMounted || !expandedMapReady || !selectedMarkerAnchor) {
+      return;
+    }
+    if (!mapRef.current) {
+      return;
+    }
+
+    const cameraKey = `${selectedMarkerAnchor.id}:${Math.round(resolvedSheetHeight)}`;
+    if (lastSelectionCameraKeyRef.current === cameraKey) {
+      return;
+    }
+    lastSelectionCameraKeyRef.current = cameraKey;
+
+    mapRef.current.fitToCoordinates([selectedMarkerAnchor.coordinate], {
+      edgePadding: {
+        top: CAMERA_TOP_PADDING,
+        right: CAMERA_SIDE_PADDING,
+        left: CAMERA_SIDE_PADDING,
+        bottom: ctaBottomOffset + resolvedCtaHeight + CAMERA_BOTTOM_BUFFER,
+      },
+      animated: true,
+    });
+  }, [
+    mapExpanded,
+    expandedMapMounted,
+    expandedMapReady,
+    selectedMarkerAnchor,
+    resolvedSheetHeight,
+    ctaBottomOffset,
+    resolvedCtaHeight,
+  ]);
 
   useEffect(() => {
     if (hasAutoCenteredRef.current) return;
     if (hasValidUserLocation) return;
-    if (!discoverEvents.length) return;
+    if (visibleMapMarkers.length === 0) return;
 
-    const firstWithCoords = discoverEvents.find((event) => hasValidCoordinate(event));
-    if (!firstWithCoords) {
+    const firstMarker = visibleMapMarkers[0];
+    if (!firstMarker) {
       return;
     }
 
@@ -744,14 +1584,14 @@ export default function DiscoverScreen() {
 
     const current = mapRegionRef.current ?? DEFAULT_REGION;
     const nextRegion = {
-      latitude: firstWithCoords.latitude,
-      longitude: firstWithCoords.longitude,
+      latitude: firstMarker.coordinate.latitude,
+      longitude: firstMarker.coordinate.longitude,
       latitudeDelta: current.latitudeDelta ?? 0.2,
       longitudeDelta: current.longitudeDelta ?? 0.2,
     };
 
     setMapRegion(nextRegion);
-  }, [discoverEvents, hasValidUserLocation]);
+  }, [visibleMapMarkers, hasValidUserLocation]);
 
   const sanitizeFilters = useCallback(
     (filters: DiscoverFilters): DiscoverFilters => {
@@ -841,9 +1681,9 @@ export default function DiscoverScreen() {
       const searchParams = new URLSearchParams();
       const trimmedSearch = debouncedQuery.trim();
 
-      if (appliedTagSlug) searchParams.append("tag", appliedTagSlug);
-      if (appliedCategorySlug) searchParams.append("category", appliedCategorySlug);
-      if (appliedSubcategorySlug) searchParams.append("subcategory", appliedSubcategorySlug);
+      if (debouncedAppliedTagSlug) searchParams.append("tag", debouncedAppliedTagSlug);
+      if (debouncedAppliedCategorySlug) searchParams.append("category", debouncedAppliedCategorySlug);
+      if (debouncedAppliedSubcategorySlug) searchParams.append("subcategory", debouncedAppliedSubcategorySlug);
       if (appliedFilters.date) searchParams.append("date", appliedFilters.date.toISOString().split("T")[0]);
       if (appliedFilters.minRating != null) searchParams.append("min_rating", String(appliedFilters.minRating));
       if (trimmedSearch) searchParams.append("q", trimmedSearch);
@@ -859,7 +1699,7 @@ export default function DiscoverScreen() {
       }
 
       const qs = searchParams.toString();
-      const data = await request<{ events: Event[] }>(qs ? `/api/events?${qs}` : "/api/events", {
+      const data = await request<{ events?: unknown }>(qs ? `/api/events?${qs}` : "/api/events", {
         timeoutMs: 20000,
         signal: abortController.signal,
       });
@@ -867,7 +1707,7 @@ export default function DiscoverScreen() {
         return;
       }
 
-      const nextEvents = data.events ?? [];
+      const nextEvents = sanitizeEventsPayload(data.events);
 
       if (railAtStart !== "all" && nextEvents.length === 0) {
         setRailNotice("No events found — showing all events.");
@@ -946,9 +1786,9 @@ export default function DiscoverScreen() {
     }
   }, [
     debouncedQuery,
-    appliedTagSlug,
-    appliedCategorySlug,
-    appliedSubcategorySlug,
+    debouncedAppliedTagSlug,
+    debouncedAppliedCategorySlug,
+    debouncedAppliedSubcategorySlug,
     appliedFilters.date,
     appliedFilters.minRating,
     appliedFilters.radiusKm,
@@ -992,37 +1832,93 @@ export default function DiscoverScreen() {
           style={styles.searchInput}
         />
 
-        <View style={styles.categoryRailWrap}>
-          <CategoryRail chips={railChips} selectedKey={selectedRailCategory} onSelect={handleSelectRailChip} />
-          {railNotice && (
-            <View style={styles.railNoticePill}>
-              <Text style={styles.railNoticeText}>{railNotice}</Text>
+        <View style={styles.discoverControlStrip}>
+          <View style={styles.categoryModeSection}>
+            <View style={styles.categoryRailWrap}>
+              <CategoryRail chips={railChips} selectedKey={selectedRailCategory} onSelect={handleSelectRailChip} />
+              {railNotice && (
+                <View style={styles.railNoticePill}>
+                  <Text style={styles.railNoticeText}>{railNotice}</Text>
+                </View>
+              )}
+            </View>
+          </View>
+
+          <View style={styles.secondaryControlsSection}>
+            <View style={styles.smartControlsWrap}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.smartControlsRow}
+              >
+                {SORT_CHIPS.map((chip) => {
+                  const active = sortMode === chip.key;
+                  const unavailable = chip.key === "distance" && !hasValidUserLocation;
+                  return (
+                    <Pressable
+                      key={chip.key}
+                      onPress={() => handleSelectSortChip(chip.key)}
+                      style={[
+                        styles.smartChip,
+                        active && styles.smartChipActive,
+                        unavailable && styles.smartChipDisabled,
+                      ]}
+                    >
+                      <Text style={[styles.smartChipText, active && styles.smartChipTextActive]}>
+                        {chip.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+
+              <View style={styles.smartControlsRow}>
+                <Pressable
+                  onPress={() => handleToggleQuickFilter("free")}
+                  style={[styles.smartChip, quickFilters.free && styles.smartChipActive]}
+                >
+                  <Text style={[styles.smartChipText, quickFilters.free && styles.smartChipTextActive]}>Free</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => handleToggleQuickFilter("tonight")}
+                  style={[styles.smartChip, quickFilters.tonight && styles.smartChipActive]}
+                >
+                  <Text style={[styles.smartChipText, quickFilters.tonight && styles.smartChipTextActive]}>Tonight</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => handleToggleQuickFilter("highRated")}
+                  style={[styles.smartChip, quickFilters.highRated && styles.smartChipActive]}
+                >
+                  <Text style={[styles.smartChipText, quickFilters.highRated && styles.smartChipTextActive]}>4.5+</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+
+          {activeFilterChips.length > 0 && (
+            <View style={styles.filterSummarySection}>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.activeFilterRow}>
+                {activeFilterChips.map((chip) => (
+                  <Pressable key={chip.key} style={styles.activeFilterChip} onPress={() => handleClearActiveChip(chip.key)}>
+                    <Text style={styles.activeFilterChipText}>{chip.label} ×</Text>
+                  </Pressable>
+                ))}
+                <Pressable style={styles.activeFilterChip} onPress={clearAllFilters}>
+                  <Text style={styles.activeFilterChipText}>Clear all</Text>
+                </Pressable>
+              </ScrollView>
             </View>
           )}
         </View>
 
         <View style={styles.embeddedMapContainer}>
-          <MapView
-            style={styles.embeddedMap}
-            provider={PROVIDER_GOOGLE}
-            pointerEvents="none"
+          <EventMap
+            variant="preview"
+            events={visibleMapMarkers}
+            userPin={hasValidUserLocation ? userLocation : null}
+            defaultRegion={DEFAULT_REGION}
             region={getPreviewRegion()}
-          >
-            {hasValidUserLocation && userLocation && (
-              <Marker coordinate={userLocation} title="Your location" pinColor={USER_PIN_COLOR} />
-            )}
-            {discoverEvents.map((event) => {
-              if (!hasValidCoordinate(event)) return null;
-              return (
-                <Marker
-                  key={event.id}
-                  coordinate={{ latitude: event.latitude, longitude: event.longitude }}
-                  title={event.title}
-                  description={event.location?.name ?? ""}
-                />
-              );
-            })}
-          </MapView>
+          />
           <Pressable style={styles.expandMapCta} onPress={() => setMapExpanded(true)}>
             <Text style={styles.expandMapCtaText}>Expand Map</Text>
           </Pressable>
@@ -1039,6 +1935,48 @@ export default function DiscoverScreen() {
             <Text style={styles.sectionTitle}>Events</Text>
             {loading && <ActivityIndicator size="small" color={PALETTE.accent} />}
           </View>
+
+          {showForYouRail && (
+            <View style={styles.forYouSection}>
+              <Text style={styles.forYouTitle}>For You</Text>
+              <Text style={styles.forYouSubtitle}>Based on what you save and view</Text>
+              <FlatList
+                data={forYouItems}
+                horizontal
+                keyExtractor={(item) => `foryou-${item.model.id}`}
+                contentContainerStyle={styles.forYouRow}
+                ItemSeparatorComponent={() => <View style={{ width: 10 }} />}
+                showsHorizontalScrollIndicator={false}
+                renderItem={({ item }) => (
+                  <ForYouMiniCard
+                    title={item.model.title}
+                    timeLabel={item.model.timeLabel}
+                    reasonLabel={item.reasonLabel}
+                    imageUrl={item.model.coverImageUrl}
+                    onPress={() => handleOpenEventFromList(item.model.event)}
+                  />
+                )}
+              />
+            </View>
+          )}
+
+          {!showForYouRail && !hasTasteSignals && (
+            <View style={styles.vibePickerCard}>
+              <Text style={styles.vibePickerTitle}>Pick your vibe</Text>
+              <Text style={styles.vibePickerSubtitle}>Seed smarter recommendations instantly</Text>
+              <View style={styles.vibePickerRow}>
+                {VIBE_OPTIONS.map((option) => (
+                  <Pressable
+                    key={option.value}
+                    style={styles.vibeChip}
+                    onPress={() => handlePickVibe(option.label)}
+                  >
+                    <Text style={styles.vibeChipText}>{option.label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          )}
 
           {isUsingCachedResults && cachedIndicator && (
             <View style={styles.cachedPill}>
@@ -1064,7 +2002,7 @@ export default function DiscoverScreen() {
             </View>
           )}
 
-          {events && cardViewModels.length === 0 && !loading && !error && (
+          {events && sortedCardViewModels.length === 0 && !loading && !error && (
             <View style={styles.emptyState}>
               <Text style={styles.emptyTitle}>No events match the filters.</Text>
               <Text style={styles.emptySubtitle}>Try clearing filters or dropping a pin to widen the search.</Text>
@@ -1072,7 +2010,7 @@ export default function DiscoverScreen() {
                 <Pressable
                   style={styles.emptyButton}
                   onPress={() => {
-                    setAppliedFilters(cloneFilters(DEFAULT_DISCOVER_FILTERS));
+                    clearAllFilters();
                     setSearchQuery("");
                     setDebouncedQuery("");
                   }}
@@ -1086,16 +2024,20 @@ export default function DiscoverScreen() {
             </View>
           )}
 
-          {cardViewModels.length > 0 && (
+          {sortedCardViewModels.length > 0 && (
             <FlatList
-              data={cardViewModels}
+              data={sortedCardViewModels}
               keyExtractor={(item) => item.id}
               scrollEnabled={false}
               ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
               renderItem={({ item }) => (
                 <EventCard
                   model={item}
-                  onPress={() => router.push(`/event/${item.id}`)}
+                  onPress={() => handleOpenEventFromList(item.event)}
+                  saved={isEventSaved(item.id)}
+                  savePending={pendingSaveIds.has(item.id)}
+                  saveDisabledReason={!isAuthed ? "Sign in to save events." : null}
+                  onToggleSave={() => handleToggleSaveEvent(item.event)}
                 />
               )}
             />
@@ -1259,7 +2201,13 @@ export default function DiscoverScreen() {
                   }}
                 />
 
-                <Pressable style={styles.advancedToggle} onPress={() => setAdvancedExpanded((prev) => !prev)}>
+                <Pressable
+                  style={styles.advancedToggle}
+                  onPress={() => {
+                    runCalmLayout();
+                    setAdvancedExpanded((prev) => !prev);
+                  }}
+                >
                   <Text style={styles.advancedToggleText}>Advanced Filters</Text>
                   <Text style={styles.advancedToggleIcon}>{advancedExpanded ? "▲" : "▼"}</Text>
                 </Pressable>
@@ -1398,7 +2346,7 @@ export default function DiscoverScreen() {
           </View>
         </Modal>
 
-        <Modal visible={mapExpanded} animationType="slide" onRequestClose={() => setMapExpanded(false)}>
+        <Modal visible={mapExpanded} animationType="slide" onShow={handleExpandedMapShow} onRequestClose={() => setMapExpanded(false)}>
           <View style={styles.modalBackdrop}>
             <View style={styles.modalActionsLeft}>
               <Pressable style={styles.modalActionButton} onPress={() => setMapExpanded(false)}>
@@ -1432,63 +2380,44 @@ export default function DiscoverScreen() {
               </Text>
             </View>
 
-            <MapView
-              style={{ flex: 1 }}
-              ref={mapRef}
-              provider={PROVIDER_GOOGLE}
-              initialRegion={getPreviewRegion()}
-              onMapReady={() => {
-                setMapReady(true);
-                const target = getTargetRegion();
-                setMapRegion(target);
-                mapRef.current?.animateToRegion(target, 0);
-              }}
-              onRegionChangeComplete={(region) => {
-                if (!mapReady) return;
-                if (
-                  !Number.isFinite(region.latitude) ||
-                  !Number.isFinite(region.longitude) ||
-                  !Number.isFinite(region.latitudeDelta) ||
-                  !Number.isFinite(region.longitudeDelta)
-                ) {
-                  return;
-                }
-                setMapRegion(region);
-              }}
-              onLongPress={(event) => handleDropPin(event.nativeEvent.coordinate)}
-            >
-              {hasValidUserLocation && userLocation && (
-                <Marker
-                  coordinate={userLocation}
-                  title="Your location"
-                  pinColor={USER_PIN_COLOR}
-                  draggable
-                  onDragEnd={(event) => handleDropPin(event.nativeEvent.coordinate)}
-                />
-              )}
-              {discoverEvents.map((event) => {
-                if (!hasValidCoordinate(event)) return null;
-                return (
-                  <Marker
-                    key={event.id}
-                    coordinate={{ latitude: event.latitude, longitude: event.longitude }}
-                    title={event.title}
-                    description={event.location?.name ?? ""}
-                  >
-                    <Callout onPress={() => setSelectedEvent(event)}>
-                      <View style={{ maxWidth: 200, padding: 4 }}>
-                        <Text style={{ fontWeight: "700" }}>{event.title}</Text>
-                        <Text>{event.location?.name ?? ""}</Text>
-                        <Text style={{ color: PALETTE.accent, marginTop: 4 }}>Details</Text>
-                      </View>
-                    </Callout>
-                  </Marker>
-                );
-              })}
-            </MapView>
+            {expandedMapMounted ? (
+              <EventMap
+                ref={mapRef}
+                variant="full"
+                events={visibleMapMarkers}
+                userPin={hasValidUserLocation ? userLocation : null}
+                defaultRegion={DEFAULT_REGION}
+                selectedEventId={selectedEvent?.id ?? null}
+                onMapReady={() => setExpandedMapReady(true)}
+                onRegionChangeComplete={handleExpandedMapRegionChangeComplete}
+                onLongPress={handleDropPin}
+                onUserPinDragEnd={handleDropPin}
+                onMarkerPress={handleMapMarkerPress}
+                showLoadingOverlay
+              />
+            ) : (
+              <View style={styles.expandedMapPlaceholder}>
+                <ActivityIndicator size="small" color={PALETTE.accent} />
+                <Text style={styles.expandedMapPlaceholderText}>Loading map...</Text>
+              </View>
+            )}
 
             {selectedEvent && (
-              <View style={styles.sheet}>
+              <View
+                style={[
+                  styles.sheet,
+                  {
+                    paddingBottom: 14 + insets.bottom,
+                  },
+                ]}
+                onLayout={(event) => {
+                  const nextHeight = event.nativeEvent.layout.height;
+                  if (!Number.isFinite(nextHeight) || nextHeight <= 0) {
+                    return;
+                  }
+                  setSelectedCardHeight(nextHeight);
+                }}
+              >
                 <View style={styles.sheetHeaderRow}>
                   <Text style={styles.sheetEventTitle} numberOfLines={1}>
                     {selectedEvent.title}
@@ -1499,7 +2428,7 @@ export default function DiscoverScreen() {
                 </View>
                 {selectedEvent.location?.name && <Text style={styles.sheetMeta}>{selectedEvent.location.name}</Text>}
                 {selectedEvent.category && <Text style={styles.sheetMeta}>{selectedEvent.category}</Text>}
-                <Pressable style={styles.sheetButton} onPress={() => handleOpenEvent(selectedEvent.id)}>
+                <Pressable style={styles.sheetButton} onPress={() => handleOpenEvent(selectedEvent)}>
                   <Text style={styles.sheetButtonText}>Open event</Text>
                 </Pressable>
               </View>
@@ -1516,9 +2445,10 @@ export default function DiscoverScreen() {
                 <FlatList
                   data={visibleEvents}
                   keyExtractor={(item) => item.id}
+                  contentContainerStyle={{ paddingBottom: insets.bottom + BOTTOM_GAP }}
                   ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
                   renderItem={({ item }) => (
-                    <Pressable style={({ pressed }) => [styles.card, pressed && { opacity: 0.9 }]} onPress={() => handleOpenEvent(item.id)}>
+                    <Pressable style={({ pressed }) => [styles.card, pressed && { opacity: 0.9 }]} onPress={() => handleOpenEvent(item)}>
                       <Text style={styles.cardTitle}>{item.title}</Text>
                       {item.category && <Text style={styles.cardMeta}>{item.category}</Text>}
                       <Text style={styles.cardMeta}>{item.location?.name ?? "Unknown location"}</Text>
@@ -1530,8 +2460,18 @@ export default function DiscoverScreen() {
             )}
 
             {!showListOverlay && (
-              <View style={styles.listToggleContainer}>
-                <Pressable style={styles.modalActionButton} onPress={() => setShowListOverlay(true)}>
+              <View style={[styles.listToggleContainer, { bottom: ctaBottomOffset }]}>
+                <Pressable
+                  style={styles.modalActionButton}
+                  onLayout={(event) => {
+                    const nextHeight = event.nativeEvent.layout.height;
+                    if (!Number.isFinite(nextHeight) || nextHeight <= 0) {
+                      return;
+                    }
+                    setCtaHeight(nextHeight);
+                  }}
+                  onPress={() => setShowListOverlay(true)}
+                >
                   <Text style={styles.modalCloseText}>Show list</Text>
                 </Pressable>
               </View>
@@ -1634,8 +2574,77 @@ const styles = StyleSheet.create({
     backgroundColor: PALETTE.surface,
     fontSize: 14,
   },
+  discoverControlStrip: {
+    backgroundColor: PALETTE.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    borderRadius: 16,
+    padding: 12,
+    gap: 10,
+  },
+  categoryModeSection: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: PALETTE.line,
+    paddingBottom: 10,
+  },
   categoryRailWrap: {
     gap: 8,
+  },
+  secondaryControlsSection: {
+    gap: 6,
+    paddingTop: 2,
+  },
+  smartControlsWrap: {
+    gap: 6,
+  },
+  smartControlsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  smartChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  smartChipActive: {
+    backgroundColor: PALETTE.accentSoft,
+    borderColor: PALETTE.line,
+  },
+  smartChipDisabled: {
+    opacity: 0.55,
+  },
+  smartChipText: {
+    color: PALETTE.muted,
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  smartChipTextActive: {
+    color: PALETTE.accent,
+  },
+  filterSummarySection: {
+    paddingTop: 2,
+  },
+  activeFilterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+  activeFilterChip: {
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    backgroundColor: PALETTE.surfaceAlt,
+  },
+  activeFilterChipText: {
+    color: PALETTE.muted,
+    fontSize: 11,
+    fontWeight: "600",
   },
   railNoticePill: {
     alignSelf: "flex-start",
@@ -1658,25 +2667,26 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: PALETTE.line,
   },
-  embeddedMap: {
-    width: "100%",
-    height: "100%",
-  },
   expandMapCta: {
     position: "absolute",
-    top: 10,
-    right: 10,
-    backgroundColor: "rgba(22,20,34,0.9)",
+    top: 12,
+    right: 12,
+    backgroundColor: "rgba(17, 15, 27, 0.94)",
     borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 7,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: PALETTE.line,
+    borderColor: "rgba(245, 243, 255, 0.2)",
+    shadowColor: "#07060d",
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 5,
   },
   expandMapCtaText: {
     color: PALETTE.text,
     fontSize: 12,
-    fontWeight: "600",
+    fontWeight: "700",
   },
   filtersButton: {
     alignSelf: "flex-start",
@@ -1710,6 +2720,57 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
     color: PALETTE.text,
+  },
+  forYouSection: {
+    gap: 8,
+  },
+  forYouTitle: {
+    color: PALETTE.text,
+    fontSize: 17,
+    fontWeight: "700",
+  },
+  forYouSubtitle: {
+    color: PALETTE.muted,
+    fontSize: 12,
+    fontWeight: "500",
+  },
+  forYouRow: {
+    paddingRight: 12,
+  },
+  vibePickerCard: {
+    padding: 12,
+    borderRadius: 14,
+    backgroundColor: PALETTE.surface,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    gap: 8,
+  },
+  vibePickerTitle: {
+    color: PALETTE.text,
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  vibePickerSubtitle: {
+    color: PALETTE.muted,
+    fontSize: 12,
+  },
+  vibePickerRow: {
+    flexDirection: "row",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  vibeChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: PALETTE.line,
+    backgroundColor: PALETTE.accentSoft,
+  },
+  vibeChipText: {
+    color: PALETTE.accent,
+    fontSize: 12,
+    fontWeight: "600",
   },
   cachedPill: {
     alignSelf: "flex-start",
@@ -1968,6 +3029,18 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: PALETTE.background,
   },
+  expandedMapPlaceholder: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    backgroundColor: PALETTE.background,
+  },
+  expandedMapPlaceholderText: {
+    color: PALETTE.text,
+    fontSize: 12,
+    fontWeight: "600",
+  },
   modalCloseText: {
     color: PALETTE.text,
     fontWeight: "600",
@@ -2006,7 +3079,6 @@ const styles = StyleSheet.create({
   },
   listToggleContainer: {
     position: "absolute",
-    bottom: 24,
     left: 0,
     right: 0,
     alignItems: "center",
@@ -2052,11 +3124,13 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     backgroundColor: PALETTE.surface,
-    padding: 16,
-    borderTopLeftRadius: 16,
-    borderTopRightRadius: 16,
-    gap: 8,
-    minHeight: 200,
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 14,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    gap: 6,
+    minHeight: 136,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: PALETTE.line,
   },
@@ -2066,7 +3140,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   sheetEventTitle: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: "700",
     color: PALETTE.text,
     flex: 1,
@@ -2081,14 +3155,14 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   sheetMeta: {
-    fontSize: 13,
+    fontSize: 12,
     color: PALETTE.muted,
   },
   sheetButton: {
-    marginTop: 8,
+    marginTop: 4,
     backgroundColor: PALETTE.accent,
-    paddingVertical: 10,
-    borderRadius: 10,
+    paddingVertical: 9,
+    borderRadius: 999,
     alignItems: "center",
   },
   sheetButtonText: {

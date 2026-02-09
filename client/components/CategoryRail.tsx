@@ -24,12 +24,6 @@ type CategoryRailProps = {
   onSelect: (chip: RailChip) => void;
 };
 
-const PALETTE = {
-  text: "#f5f3ff",
-  line: "#2c2740",
-  accent: "#8f6bff",
-};
-
 type ChipLayout = {
   x: number;
   width: number;
@@ -64,11 +58,11 @@ function ChipButtonBase({
     () => ({
       backgroundColor: selection.interpolate({
         inputRange: [0, 1],
-        outputRange: ["rgba(28, 25, 48, 0.9)", PALETTE.accent],
+        outputRange: ["rgba(28, 25, 48, 0.9)", "rgba(143, 107, 255, 0.96)"],
       }),
       borderColor: selection.interpolate({
         inputRange: [0, 1],
-        outputRange: ["rgba(44, 39, 64, 0.9)", PALETTE.accent],
+        outputRange: ["rgba(44, 39, 64, 0.9)", "rgba(143, 107, 255, 1)"],
       }),
     }),
     [selection]
@@ -78,7 +72,7 @@ function ChipButtonBase({
     () => ({
       color: selection.interpolate({
         inputRange: [0, 1],
-        outputRange: ["#c6c3d7", "#ffffff"],
+        outputRange: ["#b8b4cd", "#ffffff"],
       }),
     }),
     [selection]
@@ -212,7 +206,7 @@ export function CategoryRail({ chips, selectedKey, onSelect }: CategoryRailProps
 
 const styles = StyleSheet.create({
   container: {
-    minHeight: 40,
+    minHeight: 44,
   },
   content: {
     flexDirection: "row",
@@ -222,23 +216,24 @@ const styles = StyleSheet.create({
   chip: {
     borderRadius: 999,
     borderWidth: StyleSheet.hairlineWidth,
-    minHeight: 38,
+    minHeight: 42,
     justifyContent: "center",
   },
   chipPressable: {
-    minHeight: 38,
-    paddingHorizontal: 14,
+    minHeight: 42,
+    paddingHorizontal: 16,
     justifyContent: "center",
     alignItems: "center",
   },
   chipText: {
-    fontSize: 13,
     letterSpacing: 0.1,
   },
   chipTextSelected: {
+    fontSize: 14,
     fontWeight: "700",
   },
   chipTextUnselected: {
+    fontSize: 13,
     fontWeight: "600",
   },
   chipDisabled: {

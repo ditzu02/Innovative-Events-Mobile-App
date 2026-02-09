@@ -1,5 +1,6 @@
 import { memo, useCallback, useMemo, useRef } from "react";
 import { Animated, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
 import { EventStatus } from "@/lib/event-formatting";
 
@@ -28,12 +29,24 @@ export type EventCardViewModel = {
 type EventCardProps = {
   model: EventCardViewModel;
   onPress: () => void;
+  saved?: boolean;
+  onToggleSave?: () => void;
+  savePending?: boolean;
+  saveDisabledReason?: string | null;
 };
 
-function EventCardBase({ model, onPress }: EventCardProps) {
+function EventCardBase({
+  model,
+  onPress,
+  saved = false,
+  onToggleSave,
+  savePending = false,
+  saveDisabledReason = null,
+}: EventCardProps) {
   const scale = useRef(new Animated.Value(1)).current;
   const showStatusBadge = model.status === "LIVE" || model.status === "SOON";
   const timePillStyle = getTimePillStyle(model.status);
+  const canToggleSave = !!onToggleSave && !savePending;
 
   const metaLeftLabel = useMemo(
     () => [model.locationLabel, model.priceLabel].filter(Boolean).join(" • "),
@@ -53,61 +66,83 @@ function EventCardBase({ model, onPress }: EventCardProps) {
 
   return (
     <Animated.View style={[styles.animatedWrap, { transform: [{ scale }] }]}>
-      <Pressable
-        onPress={onPress}
-        onPressIn={() => animateScale(0.98)}
-        onPressOut={() => animateScale(1)}
-        style={styles.card}
-      >
-        <View style={styles.heroWrap}>
-          {model.coverImageUrl ? (
-            <Image source={{ uri: model.coverImageUrl }} style={styles.heroImage} resizeMode="cover" />
-          ) : (
-            <View style={styles.placeholderHero}>
-              <Text style={styles.placeholderToken}>{model.placeholderToken}</Text>
-            </View>
-          )}
-          {showStatusBadge && model.statusLabel && (
-            <View style={[styles.statusBadge, getStatusStyle(model.status)]}>
-              <Text style={styles.statusText}>{model.statusLabel}</Text>
-            </View>
-          )}
-          <View style={styles.heroScrim} />
-        </View>
-
-        <View style={styles.body}>
-          <Text style={styles.title} numberOfLines={2} ellipsizeMode="tail">
-            {model.title}
-          </Text>
-
-          <View style={[styles.timePill, timePillStyle]}>
-            <Text numberOfLines={1} style={styles.timePillText}>{model.timeLabel}</Text>
+      <View style={styles.cardWrap}>
+        <Pressable
+          onPress={onPress}
+          onPressIn={() => animateScale(0.98)}
+          onPressOut={() => animateScale(1)}
+          style={styles.card}
+        >
+          <View style={styles.heroWrap}>
+            {model.coverImageUrl ? (
+              <Image source={{ uri: model.coverImageUrl }} style={styles.heroImage} resizeMode="cover" />
+            ) : (
+              <View style={styles.placeholderHero}>
+                <Text style={styles.placeholderToken}>{model.placeholderToken}</Text>
+              </View>
+            )}
+            {showStatusBadge && model.statusLabel && (
+              <View style={[styles.statusBadge, getStatusStyle(model.status)]}>
+                <Text style={styles.statusText}>{model.statusLabel}</Text>
+              </View>
+            )}
+            <View style={styles.heroScrim} />
           </View>
 
-          {(metaLeftLabel || model.ratingLabel) && (
-            <View style={styles.infoBand}>
-              {metaLeftLabel ? (
-                <Text numberOfLines={1} style={styles.infoBandLeft}>{metaLeftLabel}</Text>
-              ) : (
-                <View style={{ flex: 1 }} />
-              )}
-              {model.ratingLabel && (
-                <Text numberOfLines={1} style={styles.infoBandRight}>{model.ratingLabel}</Text>
-              )}
-            </View>
-          )}
+          <View style={styles.body}>
+            <Text style={styles.title} numberOfLines={2} ellipsizeMode="tail">
+              {model.title}
+            </Text>
 
-          {model.visibleTags.length > 0 && (
-            <View style={styles.tagsRow}>
-              {model.visibleTags.map((tag) => (
-                <View key={tag} style={styles.tagChip}>
-                  <Text style={styles.tagText} numberOfLines={1}>{tag}</Text>
-                </View>
-              ))}
+            <View style={[styles.timePill, timePillStyle]}>
+              <Text numberOfLines={1} style={styles.timePillText}>{model.timeLabel}</Text>
             </View>
-          )}
-        </View>
-      </Pressable>
+
+            {(metaLeftLabel || model.ratingLabel) && (
+              <View style={styles.infoBand}>
+                {metaLeftLabel ? (
+                  <Text numberOfLines={1} style={styles.infoBandLeft}>{metaLeftLabel}</Text>
+                ) : (
+                  <View style={{ flex: 1 }} />
+                )}
+                {model.ratingLabel && (
+                  <Text numberOfLines={1} style={styles.infoBandRight}>{model.ratingLabel}</Text>
+                )}
+              </View>
+            )}
+
+            {model.visibleTags.length > 0 && (
+              <View style={styles.tagsRow}>
+                {model.visibleTags.map((tag) => (
+                  <View key={tag} style={styles.tagChip}>
+                    <Text style={styles.tagText} numberOfLines={1}>{tag}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+        </Pressable>
+
+        {onToggleSave && (
+          <Pressable
+            onPress={onToggleSave}
+            disabled={!canToggleSave}
+            accessibilityLabel={saved ? "Remove from saved events" : "Save event"}
+            accessibilityHint={saveDisabledReason ?? undefined}
+            style={[
+              styles.saveButton,
+              saved && styles.saveButtonActive,
+              !canToggleSave && styles.saveButtonDisabled,
+            ]}
+          >
+            <MaterialIcons
+              name={saved ? "bookmark" : "bookmark-border"}
+              size={18}
+              color={saved ? "#ffffff" : PALETTE.text}
+            />
+          </Pressable>
+        )}
+      </View>
     </Animated.View>
   );
 }
@@ -128,6 +163,9 @@ export const EventCard = memo(EventCardBase);
 const styles = StyleSheet.create({
   animatedWrap: {
     width: "100%",
+  },
+  cardWrap: {
+    position: "relative",
   },
   card: {
     borderRadius: 18,
@@ -256,5 +294,25 @@ const styles = StyleSheet.create({
     color: "#9f9ab4",
     fontSize: 11,
     fontWeight: "600",
+  },
+  saveButton: {
+    position: "absolute",
+    right: 10,
+    top: 10,
+    width: 32,
+    height: 32,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(11, 10, 18, 0.68)",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "rgba(245, 243, 255, 0.24)",
+  },
+  saveButtonActive: {
+    backgroundColor: "rgba(143, 107, 255, 0.95)",
+    borderColor: "rgba(143, 107, 255, 1)",
+  },
+  saveButtonDisabled: {
+    opacity: 0.62,
   },
 });

@@ -17,6 +17,8 @@ import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { useHeaderHeight } from "@react-navigation/elements";
 import { request } from "@/lib/api";
 import { useAuth } from "@/context/auth";
+import { SavedEventSummary, useSaved } from "@/context/saved";
+import { loadTasteProfile, persistTasteProfile, updateTasteProfileFromInteraction } from "@/lib/taste-profile";
 
 type EventDetail = {
   id: string;
@@ -38,17 +40,17 @@ type EventDetail = {
     longitude?: number | null;
     features?: any;
   } | null;
-  artists?: Array<{
+  artists?: {
     id: string;
     name: string;
     bio: string | null;
     image_url: string | null;
     social_links: Record<string, string> | null;
-  }>;
+  }[];
   photos?: string[];
   reviews?: {
     summary: { count: number; rating_avg: number };
-    latest: Array<{ rating: number; comment: string | null; photos: string[] | null; created_at: string | null }>;
+    latest: { rating: number; comment: string | null; photos: string[] | null; created_at: string | null }[];
   };
 };
 
@@ -65,16 +67,35 @@ const PALETTE = {
   danger: "#ff6b6b",
 };
 
+function toSavedSummary(event: EventDetail): SavedEventSummary {
+  return {
+    id: event.id,
+    title: event.title,
+    category: event.category,
+    start_time: event.start_time ?? null,
+    end_time: event.end_time ?? null,
+    description: event.description ?? null,
+    cover_image_url: event.cover_image_url ?? null,
+    location: event.location ?? null,
+    price: event.price ?? null,
+    rating_avg: event.rating_avg ?? null,
+    rating_count: event.rating_count ?? null,
+    tags: event.tags ?? [],
+    latitude: event.location?.latitude ?? null,
+    longitude: event.location?.longitude ?? null,
+    distance_km: null,
+  };
+}
+
 export default function EventDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
   const headerHeight = useHeaderHeight();
   const { isAuthed } = useAuth();
+  const { isEventSaved, pendingSaveIds, toggleSave } = useSaved();
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
-  const [saveLoading, setSaveLoading] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -94,9 +115,12 @@ export default function EventDetailScreen() {
   const reviewFormY = useRef<number | null>(null);
   const commentInputOffsetY = useRef<number | null>(null);
   const photosInputOffsetY = useRef<number | null>(null);
+  const trackedOpenEventIdRef = useRef<string | null>(null);
 
   const ticketUrl = event?.ticket_url?.trim() ?? "";
   const directionsUrl = getDirectionsUrl(event);
+  const saved = isEventSaved(id);
+  const saveLoading = Boolean(id) && pendingSaveIds.has(id);
 
   const scrollToY = useCallback((y: number | null | undefined) => {
     if (y == null) return;
@@ -152,60 +176,66 @@ export default function EventDetailScreen() {
   }, [pendingReviewScroll, scrollToY]);
 
   useEffect(() => {
-    if (!id || !canSave) {
-      setSaved(false);
-      setSaveError(null);
+    if (!event?.id) {
       return;
     }
+    if (trackedOpenEventIdRef.current === event.id) {
+      return;
+    }
+    trackedOpenEventIdRef.current = event.id;
     let cancelled = false;
+
     (async () => {
-      try {
-        const data = await request<{ saved: boolean }>(`/api/saved/${id}`, { timeoutMs: 8000 });
-        if (!cancelled) {
-          setSaved(Boolean(data.saved));
-          setSaveError(null);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : "Unknown error";
-          setSaveError(message);
-        }
-      }
-    })();
+      const profile = await loadTasteProfile();
+      if (cancelled) return;
+      const next = updateTasteProfileFromInteraction(profile, {
+        type: "open",
+        event: {
+          category: event.category,
+          tags: event.tags ?? [],
+          rating_avg: event.rating_avg ?? null,
+          rating_count: event.rating_count ?? null,
+          start_time: event.start_time ?? null,
+        },
+      });
+      await persistTasteProfile(next);
+    })().catch(() => undefined);
+
     return () => {
       cancelled = true;
     };
-  }, [id, canSave, request]);
+  }, [event?.id, event?.category, event?.tags, event?.rating_avg, event?.rating_count, event?.start_time]);
 
   const handleToggleSave = async () => {
-    if (!id || saveLoading) return;
+    if (!event || !id || saveLoading) return;
     if (!canSave) {
       showSaveNotice("Sign in to save events.");
       router.push("/account");
       return;
     }
-    setSaveLoading(true);
     try {
-      if (saved) {
-        await request(`/api/saved/${id}`, { method: "DELETE", timeoutMs: 12000 });
-        setSaved(false);
-        showSaveNotice("Removed from saved.");
-      } else {
-        await request("/api/saved", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ event_id: id }),
-          timeoutMs: 12000,
-        });
-        setSaved(true);
+      const savedNow = await toggleSave(toSavedSummary(event));
+      if (savedNow) {
         showSaveNotice("Saved to your list.");
+        const profile = await loadTasteProfile();
+        const next = updateTasteProfileFromInteraction(profile, {
+          type: "save",
+          event: {
+            category: event.category,
+            tags: event.tags ?? [],
+            rating_avg: event.rating_avg ?? null,
+            rating_count: event.rating_count ?? null,
+            start_time: event.start_time ?? null,
+          },
+        });
+        await persistTasteProfile(next);
+      } else {
+        showSaveNotice("Removed from saved.");
       }
       setSaveError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setSaveError(message);
-    } finally {
-      setSaveLoading(false);
     }
   };
 

@@ -1,28 +1,15 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
-import { request } from "@/lib/api";
-import { useAuth } from "@/context/auth";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-type Event = {
-  id: string;
-  title: string;
-  category: string | null;
-  location?: {
-    name?: string | null;
-    address?: string | null;
-  } | null;
-  start_time: string | null;
-  end_time: string | null;
-  description: string | null;
-  cover_image_url?: string | null;
-  price?: number | null;
-  rating_avg?: number | null;
-  rating_count?: number | null;
-  tags?: string[];
-};
+import { useAuth } from "@/context/auth";
+import { SavedEventSummary, useSaved } from "@/context/saved";
+import { EventCard, EventCardViewModel } from "@/components/EventCard";
+import { EventStatus, formatEventTime, formatLocationLabel, formatPrice, getEventStatus, pickTopTags } from "@/lib/event-formatting";
+
+type SavedCardViewModel = EventCardViewModel & { event: SavedEventSummary };
 
 const PALETTE = {
   background: "#0b0a12",
@@ -36,69 +23,99 @@ const PALETTE = {
   danger: "#ff6b6b",
 };
 
+function getPlaceholderToken(category: string | null, title: string): string {
+  const source = category?.trim() || title.trim();
+  if (!source) return "EV";
+  const match = source.match(/[A-Za-z0-9]/);
+  return (match?.[0] ?? "E").toUpperCase();
+}
+
+function getStatusLabel(status: Exclude<EventStatus, "ENDED">, startTime: string | null, now: Date): string | null {
+  if (status === "LIVE") return "LIVE NOW";
+  if (status === "SOON" && startTime) {
+    const start = new Date(startTime);
+    if (Number.isNaN(start.getTime())) {
+      return "Starts Soon";
+    }
+    const hours = Math.max(1, Math.ceil((start.getTime() - now.getTime()) / (60 * 60 * 1000)));
+    return `Starts in ${hours}h`;
+  }
+  return null;
+}
+
 export default function SavedScreen() {
   const router = useRouter();
   const { isAuthed, authLoading } = useAuth();
-  const [events, setEvents] = useState<Event[] | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { savedEvents, savedLoading, savedError, pendingSaveIds, refreshSaved, toggleSave } = useSaved();
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [removing, setRemoving] = useState<Record<string, boolean>>({});
-  const savedTitle = events && isAuthed ? `Saved Events (${events.length})` : "Saved Events";
+  const [clockTick, setClockTick] = useState<number>(() => Date.now());
 
-  const fetchSaved = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await request<{ events: Event[] }>("/api/saved", { timeoutMs: 12000 });
-      setEvents(data.events ?? []);
-      setError(null);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error occurred";
-      setError(message);
-    } finally {
-      setLoading(false);
-    }
-  }, [request]);
-  const handleRefresh = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      await fetchSaved();
-    } finally {
-      setRefreshing(false);
-    }
-  }, [fetchSaved]);
+  const savedTitle = isAuthed ? `Saved Events (${savedEvents.length})` : "Saved Events";
 
   useFocusEffect(
     useCallback(() => {
-      if (authLoading) {
+      if (authLoading || !isAuthed) {
         return;
       }
-      if (isAuthed) {
-        fetchSaved();
-      } else {
-        setLoading(false);
-        setEvents([]);
-        setError(null);
-      }
-    }, [fetchSaved, isAuthed, authLoading])
+      refreshSaved();
+    }, [authLoading, isAuthed, refreshSaved])
   );
 
-  const handleRemove = useCallback(async (eventId: string) => {
-    setRemoving((prev) => ({ ...prev, [eventId]: true }));
+  useEffect(() => {
+    const timer = setInterval(() => setClockTick(Date.now()), 60 * 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
     try {
-      await request(`/api/saved/${eventId}`, { method: "DELETE", timeoutMs: 12000 });
-      setEvents((prev) => (prev ? prev.filter((evt) => evt.id !== eventId) : prev));
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error occurred";
-      setError(message);
+      await refreshSaved();
     } finally {
-      setRemoving((prev) => {
-        const next = { ...prev };
-        delete next[eventId];
-        return next;
-      });
+      setRefreshing(false);
     }
-  }, [request]);
+  }, [refreshSaved]);
+
+  const cardViewModels = useMemo<SavedCardViewModel[]>(() => {
+    const now = new Date(clockTick);
+
+    return savedEvents.flatMap((event) => {
+      const status = getEventStatus(event.start_time, event.end_time, now);
+      if (status === "ENDED") {
+        return [];
+      }
+
+      const { visibleTags } = pickTopTags(event.tags, 2);
+      const ratingCount = event.rating_count ?? 0;
+      const ratingLabel =
+        event.rating_avg != null && ratingCount > 0
+          ? `★ ${event.rating_avg.toFixed(1)} (${ratingCount})`
+          : null;
+
+      return [{
+        id: event.id,
+        event,
+        title: event.title,
+        status,
+        statusLabel: getStatusLabel(status, event.start_time, now),
+        coverImageUrl: event.cover_image_url?.trim() || null,
+        placeholderToken: getPlaceholderToken(event.category, event.title),
+        timeLabel: formatEventTime(event.start_time, event.end_time, now),
+        locationLabel: formatLocationLabel(event.distance_km, event.location?.address, event.location?.name),
+        priceLabel: formatPrice(event.price),
+        visibleTags,
+        ratingLabel,
+      }];
+    });
+  }, [savedEvents, clockTick]);
+
+  const handleToggleSave = useCallback(
+    async (event: SavedEventSummary) => {
+      try {
+        await toggleSave(event);
+      } catch {}
+    },
+    [toggleSave]
+  );
 
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
@@ -116,7 +133,7 @@ export default function SavedScreen() {
         </View>
       )}
 
-      {isAuthed && loading && events === null && (
+      {isAuthed && savedLoading && savedEvents.length === 0 && (
         <View style={styles.skeletonList}>
           {[0, 1, 2].map((item) => (
             <View key={item} style={styles.skeletonCard}>
@@ -133,9 +150,9 @@ export default function SavedScreen() {
         </View>
       )}
 
-      {!loading && isAuthed && error && <Text style={styles.error}>Error: {error}</Text>}
+      {!savedLoading && isAuthed && savedError && <Text style={styles.error}>Error: {savedError}</Text>}
 
-      {!loading && isAuthed && !error && events && events.length === 0 && (
+      {!savedLoading && isAuthed && !savedError && cardViewModels.length === 0 && (
         <View style={styles.emptyState}>
           <Text style={styles.emptyTitle}>No saved events yet.</Text>
           <Text style={styles.emptySubtitle}>
@@ -147,9 +164,9 @@ export default function SavedScreen() {
         </View>
       )}
 
-      {isAuthed && events && events.length > 0 && (
+      {isAuthed && cardViewModels.length > 0 && (
         <FlatList
-          data={events}
+          data={cardViewModels}
           keyExtractor={(item) => item.id}
           refreshControl={(
             <RefreshControl
@@ -161,55 +178,13 @@ export default function SavedScreen() {
           )}
           ItemSeparatorComponent={() => <View style={styles.separator} />}
           renderItem={({ item }) => (
-            <View style={styles.card}>
-              <Text style={styles.cardTitle}>{item.title}</Text>
-              <Text style={styles.cardSubtitle}>
-                {item.location?.name ?? "Unknown location"}
-              </Text>
-              <Text style={styles.cardSubtitle}>
-                {formatTimeRange(item.start_time, item.end_time)}
-              </Text>
-              <View style={styles.rowWrap}>
-                {item.tags?.slice(0, 3).map((tag) => (
-                  <View key={tag} style={styles.badge}>
-                    <Text style={styles.badgeText}>{formatTag(tag)}</Text>
-                  </View>
-                ))}
-              </View>
-              <View style={styles.metaRow}>
-                {item.price != null && (
-                  <Text style={styles.metaText}>€{item.price.toFixed(2)}</Text>
-                )}
-                {item.rating_avg != null && (
-                  <Text style={styles.metaText}>
-                    {item.rating_avg.toFixed(1)} ({item.rating_count ?? 0})
-                  </Text>
-                )}
-              </View>
-              <View style={styles.actionRow}>
-                <Pressable
-                  onPress={() => router.push(`/event/${item.id}`)}
-                  style={({ pressed }) => [
-                    styles.secondaryButton,
-                    pressed && { opacity: 0.9 },
-                  ]}
-                >
-                  <Text style={styles.secondaryButtonText}>Open event</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => handleRemove(item.id)}
-                  disabled={!!removing[item.id]}
-                  style={({ pressed }) => [
-                    styles.removeButton,
-                    (pressed || removing[item.id]) && { opacity: 0.7 },
-                  ]}
-                >
-                  <Text style={styles.removeButtonText}>
-                    {removing[item.id] ? "Removing..." : "Remove"}
-                  </Text>
-                </Pressable>
-              </View>
-            </View>
+            <EventCard
+              model={item}
+              onPress={() => router.push(`/event/${item.id}`)}
+              saved
+              savePending={pendingSaveIds.has(item.id)}
+              onToggleSave={() => handleToggleSave(item.event)}
+            />
           )}
         />
       )}
@@ -217,35 +192,9 @@ export default function SavedScreen() {
   );
 }
 
-function formatTimeRange(start: string | null, end: string | null) {
-  if (!start || !end) return "Time TBA";
-  try {
-    const startDate = new Date(start);
-    const endDate = new Date(end);
-    const opts: Intl.DateTimeFormatOptions = {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    };
-    return `${startDate.toLocaleString(undefined, opts)} -> ${endDate.toLocaleString(undefined, {
-      hour: "numeric",
-      minute: "2-digit",
-    })}`;
-  } catch {
-    return `${start} - ${end}`;
-  }
-}
-
-function formatTag(tag: string) {
-  if (!tag) return "";
-  return tag.charAt(0).toUpperCase() + tag.slice(1);
-}
-
 const styles = StyleSheet.create({
   container: { padding: 20, gap: 12, flex: 1, backgroundColor: PALETTE.background },
   title: { fontSize: 20, fontWeight: "700", color: PALETTE.text },
-  rowWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   error: { color: PALETTE.danger, fontSize: 14 },
   skeletonList: { gap: 12 },
   skeletonCard: {
@@ -270,47 +219,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     backgroundColor: PALETTE.surfaceAlt,
   },
-  card: {
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: PALETTE.line,
-    borderRadius: 12,
-    padding: 12,
-    backgroundColor: PALETTE.surface,
-    gap: 6,
-  },
-  cardTitle: { fontSize: 16, fontWeight: "600", color: PALETTE.text },
-  cardSubtitle: { fontSize: 13, color: PALETTE.muted },
   separator: { height: 10 },
-  badge: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
-    backgroundColor: PALETTE.accentSoft,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: PALETTE.line,
-  },
-  badgeText: { fontSize: 12, color: PALETTE.accent },
-  metaRow: { flexDirection: "row", gap: 12, alignItems: "center", marginTop: 4 },
-  metaText: { fontSize: 13, color: PALETTE.text },
-  actionRow: { flexDirection: "row", gap: 8, marginTop: 6 },
-  secondaryButton: {
-    flex: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: "center",
-    backgroundColor: PALETTE.accent,
-  },
-  secondaryButtonText: { color: "#fff", fontWeight: "700" },
-  removeButton: {
-    flex: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: "center",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: PALETTE.danger,
-    backgroundColor: "rgba(255,107,107,0.15)",
-  },
-  removeButtonText: { color: PALETTE.danger, fontWeight: "700" },
   emptyState: {
     padding: 16,
     borderRadius: 12,

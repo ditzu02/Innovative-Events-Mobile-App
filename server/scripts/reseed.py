@@ -5,6 +5,8 @@ Reset + reseed demo data focused on Romania (Timișoara + București).
 - Loads DB config from server/.env (DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME;
   optionally DATABASE_URL and DB_SSLMODE).
 - --reset flag TRUNCATEs all app tables safely (TRUNCATE ... CASCADE) inside a transaction.
+- --hard can be used with --reset for cleanup-only (reset and exit, no reseed).
+- --tags seeds only categories/subcategories/tags, then exits.
 - Idempotent:
   - taxonomy upserts by unique slug (categories/subcategories/tags)
   - locations get-or-create by (name, address)
@@ -1191,8 +1193,23 @@ def main() -> int:
         action="store_true",
         help="TRUNCATE all non-taxonomy tables (keeps categories/subcategories/tags).",
     )
+    parser.add_argument(
+        "--hard",
+        action="store_true",
+        help="Use with --reset to do cleanup-only (reset DB and exit, no reseed).",
+    )
+    parser.add_argument(
+        "--tags",
+        action="store_true",
+        help="Seed only taxonomy tables (categories/subcategories/tags), then exit.",
+    )
     parser.add_argument("--no-optional", action="store_true", help="Skip optional artists/photos.")
     args = parser.parse_args()
+
+    if args.hard and not args.reset:
+        parser.error("--hard can only be used together with --reset.")
+    if args.hard and args.tags:
+        parser.error("--hard cannot be used together with --tags.")
 
     try:
         conn = connect()
@@ -1205,10 +1222,17 @@ def main() -> int:
             with conn.cursor() as cur:
                 if args.reset:
                     reset_all(cur)
+                    if args.hard:
+                        log("[done] Hard reset complete (cleanup only).")
+                        return 0
                 elif args.reset_content:
                     reset_content_keep_taxonomy(cur)
 
                 cat_ids, subcat_ids, tag_ids = seed_taxonomy(cur)
+                if args.tags:
+                    log("[done] Taxonomy seed complete (categories/subcategories/tags only).")
+                    return 0
+
                 locations = seed_locations(cur)
                 event_ids = seed_events_and_links(
                     cur,

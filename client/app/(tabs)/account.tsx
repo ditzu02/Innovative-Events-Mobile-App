@@ -4,6 +4,7 @@ import { useAuth } from "@/context/auth";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { isAdminEmail } from "@/constants/config";
+import { clearDiscoverPrefs, clearTasteProfilePrefs } from "@/lib/demo-prefs";
 
 const PALETTE = {
   background: "#0b0a12",
@@ -86,6 +87,22 @@ export default function AccountScreen() {
       setSuccess("Profile updated.");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unable to update profile";
+      setError(message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleResetDemo = async () => {
+    setSubmitting(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      await clearDiscoverPrefs();
+      await clearTasteProfilePrefs();
+      setSuccess("Demo preferences reset.");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unable to reset demo preferences";
       setError(message);
     } finally {
       setSubmitting(false);
@@ -227,6 +244,13 @@ export default function AccountScreen() {
             style={({ pressed }) => [styles.secondaryButton, pressed && { opacity: 0.8 }]}
           >
             <Text style={styles.secondaryButtonText}>Sign out</Text>
+          </Pressable>
+          <Pressable
+            onPress={handleResetDemo}
+            disabled={submitting}
+            style={({ pressed }) => [styles.secondaryButton, (pressed || submitting) && { opacity: 0.8 }]}
+          >
+            <Text style={styles.secondaryButtonText}>Reset demo state</Text>
           </Pressable>
           {isAdminEmail(user.email) && (
             <Pressable
