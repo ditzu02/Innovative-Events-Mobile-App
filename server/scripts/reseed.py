@@ -7,6 +7,8 @@ Reset + reseed demo data focused on Romania (Timișoara + București).
 - --reset flag TRUNCATEs all app tables safely (TRUNCATE ... CASCADE) inside a transaction.
 - --hard can be used with --reset for cleanup-only (reset and exit, no reseed).
 - --tags seeds only categories/subcategories/tags, then exits.
+- --export-snapshot writes current DB taxonomy + locations + events (+links) to JSON.
+- --snapshot seeds data from a previously exported snapshot JSON.
 - Idempotent:
   - taxonomy upserts by unique slug (categories/subcategories/tags)
   - locations get-or-create by (name, address)
@@ -30,6 +32,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 from psycopg2.extensions import connection as PgConn
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 
@@ -415,6 +418,548 @@ def add_event_photo(cur, *, event_id: str, photo_url: str) -> None:
         """,
         (event_id, photo_url),
     )
+
+
+def replace_event_tags(cur, *, event_id: str, tag_ids: Iterable[str]) -> None:
+    exec_sql(cur, "DELETE FROM event_tags WHERE event_id = %s", (event_id,))
+    seen: set[str] = set()
+    for tag_id in tag_ids:
+        if not tag_id or tag_id in seen:
+            continue
+        seen.add(tag_id)
+        link_event_tag(cur, event_id=event_id, tag_id=tag_id)
+
+
+def replace_event_artists(cur, *, event_id: str, artist_ids: Iterable[str]) -> None:
+    exec_sql(cur, "DELETE FROM event_artists WHERE event_id = %s", (event_id,))
+    seen: set[str] = set()
+    for artist_id in artist_ids:
+        if not artist_id or artist_id in seen:
+            continue
+        seen.add(artist_id)
+        link_event_artist(cur, event_id=event_id, artist_id=artist_id)
+
+
+def replace_event_photos(cur, *, event_id: str, photo_urls: Iterable[str]) -> None:
+    exec_sql(cur, "DELETE FROM event_photos WHERE event_id = %s", (event_id,))
+    seen: set[str] = set()
+    for photo_url in photo_urls:
+        cleaned = str(photo_url or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        add_event_photo(cur, event_id=event_id, photo_url=cleaned)
+
+
+def as_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def as_int(value: Any, *, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (int, float, Decimal)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def as_text(value: Any, *, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
+def location_key(name: str, address: str) -> str:
+    return f"{name.strip()}||{address.strip()}"
+
+
+def parse_iso_datetime(value: Any) -> datetime:
+    if value is None:
+        raise ValueError("missing datetime")
+    text = str(value).strip()
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=APP_TZ)
+    return dt
+
+
+def export_snapshot(cur, *, out_path: Path) -> None:
+    log(f"[export] Building snapshot: {out_path}")
+
+    categories_rows = fetch_all(
+        cur,
+        """
+        SELECT id::text, name, slug, icon
+        FROM categories
+        ORDER BY name ASC
+        """,
+    )
+    subcategories_rows = fetch_all(
+        cur,
+        """
+        SELECT sc.id::text, sc.name, sc.slug, c.slug
+        FROM subcategories sc
+        JOIN categories c ON c.id = sc.category_id
+        ORDER BY c.name ASC, sc.name ASC
+        """,
+    )
+    tags_rows = fetch_all(
+        cur,
+        """
+        SELECT t.id::text, t.name, t.slug, sc.slug
+        FROM tags t
+        JOIN subcategories sc ON sc.id = t.subcategory_id
+        ORDER BY sc.name ASC, t.name ASC
+        """,
+    )
+
+    locations_rows = fetch_all(
+        cur,
+        """
+        SELECT
+            id::text, name, COALESCE(address, ''), latitude, longitude,
+            COALESCE(features, '{}'::jsonb), COALESCE(cover_image_url, ''),
+            rating_avg, COALESCE(rating_count, 0)
+        FROM locations
+        ORDER BY name ASC, address ASC
+        """,
+    )
+
+    events_rows = fetch_all(
+        cur,
+        """
+        SELECT
+            e.id::text,
+            e.title,
+            COALESCE(e.category, ''),
+            COALESCE(c.slug, ''),
+            COALESCE(sc.slug, ''),
+            e.start_time,
+            e.end_time,
+            COALESCE(e.description, ''),
+            COALESCE(e.cover_image_url, ''),
+            COALESCE(e.ticket_url, ''),
+            e.price,
+            e.rating_avg,
+            COALESCE(e.rating_count, 0),
+            COALESCE(l.name, ''),
+            COALESCE(l.address, '')
+        FROM events e
+        LEFT JOIN categories c ON c.id = e.category_id
+        LEFT JOIN subcategories sc ON sc.id = e.subcategory_id
+        LEFT JOIN locations l ON l.id = e.location_id
+        ORDER BY e.start_time ASC, e.id ASC
+        """,
+    )
+
+    tag_rows = fetch_all(
+        cur,
+        """
+        SELECT et.event_id::text, COALESCE(t.slug, ''), COALESCE(t.name, '')
+        FROM event_tags et
+        JOIN tags t ON t.id = et.tag_id
+        ORDER BY et.event_id ASC, t.name ASC
+        """,
+    )
+    tags_by_event_slug: Dict[str, List[str]] = {}
+    tags_by_event_name: Dict[str, List[str]] = {}
+    for event_id, tag_slug, tag_name in tag_rows:
+        if tag_slug:
+            tags_by_event_slug.setdefault(event_id, []).append(str(tag_slug))
+        elif tag_name:
+            tags_by_event_name.setdefault(event_id, []).append(str(tag_name))
+
+    artist_rows = fetch_all(
+        cur,
+        """
+        SELECT
+            ea.event_id::text,
+            a.name,
+            COALESCE(a.bio, ''),
+            COALESCE(a.image_url, ''),
+            COALESCE(a.social_links, '{}'::jsonb)
+        FROM event_artists ea
+        JOIN artists a ON a.id = ea.artist_id
+        ORDER BY ea.event_id ASC, a.name ASC
+        """,
+    )
+    artists_by_event: Dict[str, List[Dict[str, Any]]] = {}
+    for event_id, name, bio, image_url, social_links in artist_rows:
+        artists_by_event.setdefault(event_id, []).append(
+            {
+                "name": as_text(name),
+                "bio": as_text(bio),
+                "image_url": as_text(image_url),
+                "social_links": social_links if isinstance(social_links, dict) else {},
+            }
+        )
+
+    photo_rows = fetch_all(
+        cur,
+        """
+        SELECT event_id::text, photo_url
+        FROM event_photos
+        ORDER BY event_id ASC, id ASC
+        """,
+    )
+    photos_by_event: Dict[str, List[str]] = {}
+    for event_id, photo_url in photo_rows:
+        cleaned = as_text(photo_url).strip()
+        if cleaned:
+            photos_by_event.setdefault(event_id, []).append(cleaned)
+
+    snapshot = {
+        "version": 1,
+        "exported_at": datetime.now(APP_TZ).isoformat(),
+        "taxonomy": {
+            "categories": [
+                {"name": as_text(name), "slug": as_text(slug), "icon": as_text(icon)}
+                for _id, name, slug, icon in categories_rows
+                if slug
+            ],
+            "subcategories": [
+                {
+                    "name": as_text(name),
+                    "slug": as_text(slug),
+                    "category_slug": as_text(category_slug),
+                }
+                for _id, name, slug, category_slug in subcategories_rows
+                if slug and category_slug
+            ],
+            "tags": [
+                {
+                    "name": as_text(name),
+                    "slug": as_text(slug),
+                    "subcategory_slug": as_text(subcategory_slug),
+                }
+                for _id, name, slug, subcategory_slug in tags_rows
+                if slug and subcategory_slug
+            ],
+        },
+        "locations": [
+            {
+                "name": as_text(name),
+                "address": as_text(address),
+                "latitude": float(latitude) if latitude is not None else 0.0,
+                "longitude": float(longitude) if longitude is not None else 0.0,
+                "features": features if isinstance(features, dict) else {},
+                "cover_image_url": as_text(cover_image_url),
+                "rating_avg": as_float(rating_avg),
+                "rating_count": as_int(rating_count, default=0),
+            }
+            for _id, name, address, latitude, longitude, features, cover_image_url, rating_avg, rating_count in locations_rows
+        ],
+        "events": [],
+    }
+
+    for (
+        event_id,
+        title,
+        category_text,
+        category_slug,
+        subcategory_slug,
+        start_time,
+        end_time,
+        description,
+        cover_image_url,
+        ticket_url,
+        price,
+        rating_avg,
+        rating_count,
+        location_name,
+        location_address,
+    ) in events_rows:
+        snapshot["events"].append(
+            {
+                "id": as_text(event_id),
+                "title": as_text(title),
+                "category_text": as_text(category_text),
+                "category_slug": as_text(category_slug),
+                "subcategory_slug": as_text(subcategory_slug),
+                "start_time": start_time.isoformat() if start_time else None,
+                "end_time": end_time.isoformat() if end_time else None,
+                "description": as_text(description),
+                "cover_image_url": as_text(cover_image_url),
+                "ticket_url": as_text(ticket_url),
+                "price": as_float(price),
+                "rating_avg": as_float(rating_avg),
+                "rating_count": as_int(rating_count, default=0),
+                "location_name": as_text(location_name),
+                "location_address": as_text(location_address),
+                "tag_slugs": sorted(set(tags_by_event_slug.get(as_text(event_id), []))),
+                "tag_names": sorted(set(tags_by_event_name.get(as_text(event_id), []))),
+                "artists": artists_by_event.get(as_text(event_id), []),
+                "photos": photos_by_event.get(as_text(event_id), []),
+            }
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(
+        f"[export] Snapshot written with "
+        f"{len(snapshot['taxonomy']['categories'])} categories, "
+        f"{len(snapshot['taxonomy']['subcategories'])} subcategories, "
+        f"{len(snapshot['taxonomy']['tags'])} tags, "
+        f"{len(snapshot['locations'])} locations, "
+        f"{len(snapshot['events'])} events."
+    )
+
+
+def load_snapshot(snapshot_path: Path) -> Dict[str, Any]:
+    if not snapshot_path.exists():
+        raise RuntimeError(f"Snapshot file not found: {snapshot_path}")
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Snapshot root must be a JSON object.")
+    for required in ("taxonomy", "locations", "events"):
+        if required not in payload:
+            raise RuntimeError(f"Snapshot missing key: {required}")
+    return payload
+
+
+def seed_taxonomy_from_snapshot(cur, snapshot: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    taxonomy = snapshot.get("taxonomy") if isinstance(snapshot, dict) else None
+    categories = taxonomy.get("categories") if isinstance(taxonomy, dict) else None
+    subcategories = taxonomy.get("subcategories") if isinstance(taxonomy, dict) else None
+    tags = taxonomy.get("tags") if isinstance(taxonomy, dict) else None
+
+    if not isinstance(categories, list) or not isinstance(subcategories, list):
+        raise RuntimeError("Snapshot taxonomy must include categories and subcategories arrays.")
+
+    log("[seed] Taxonomy (from snapshot)...")
+
+    cat_ids: Dict[str, str] = {}
+    for item in categories:
+        if not isinstance(item, dict):
+            continue
+        slug = as_text(item.get("slug")).strip()
+        if not slug:
+            continue
+        name = as_text(item.get("name")).strip() or slug.replace("-", " ").title()
+        icon = as_text(item.get("icon")).strip()
+        cat_ids[slug] = upsert_category(cur, name=name, slug=slug, icon=icon)
+
+    subcat_ids: Dict[str, str] = {}
+    skipped_subcats = 0
+    for item in subcategories:
+        if not isinstance(item, dict):
+            continue
+        slug = as_text(item.get("slug")).strip()
+        category_slug = as_text(item.get("category_slug")).strip()
+        if not slug or not category_slug:
+            skipped_subcats += 1
+            continue
+        category_id = cat_ids.get(category_slug)
+        if not category_id:
+            skipped_subcats += 1
+            continue
+        name = as_text(item.get("name")).strip() or slug.replace("-", " ").title()
+        subcat_ids[slug] = upsert_subcategory(cur, name=name, slug=slug, category_id=category_id)
+
+    tag_ids: Dict[str, str] = {}
+    skipped_tags = 0
+    for item in tags if isinstance(tags, list) else []:
+        if not isinstance(item, dict):
+            continue
+        slug = as_text(item.get("slug")).strip()
+        subcategory_slug = as_text(item.get("subcategory_slug")).strip()
+        if not slug or not subcategory_slug:
+            skipped_tags += 1
+            continue
+        subcategory_id = subcat_ids.get(subcategory_slug)
+        if not subcategory_id:
+            skipped_tags += 1
+            continue
+        name = as_text(item.get("name")).strip() or slug.replace("-", " ").title()
+        tag_ids[slug] = upsert_tag(cur, name=name, slug=slug, subcategory_id=subcategory_id)
+
+    log(
+        f"[seed] Taxonomy done (snapshot): {len(cat_ids)} categories, {len(subcat_ids)} subcategories, {len(tag_ids)} tags."
+    )
+    if skipped_subcats or skipped_tags:
+        log(f"[seed] Taxonomy snapshot skipped: {skipped_subcats} subcategories, {skipped_tags} tags.")
+    return cat_ids, subcat_ids, tag_ids
+
+
+def seed_from_snapshot(cur, *, snapshot: Dict[str, Any], no_optional: bool) -> List[str]:
+    cat_ids, subcat_ids, tag_ids = seed_taxonomy_from_snapshot(cur, snapshot)
+
+    taxonomy = snapshot.get("taxonomy") if isinstance(snapshot, dict) else {}
+    category_name_by_slug: Dict[str, str] = {}
+    for item in taxonomy.get("categories", []) if isinstance(taxonomy, dict) else []:
+        if isinstance(item, dict):
+            slug = as_text(item.get("slug")).strip()
+            name = as_text(item.get("name")).strip()
+            if slug and name:
+                category_name_by_slug[slug] = name
+
+    tag_subcategory_by_slug: Dict[str, str] = {}
+    tag_ids_by_name: Dict[str, List[str]] = {}
+    tag_subcategory_by_id: Dict[str, str] = {}
+    for item in taxonomy.get("tags", []) if isinstance(taxonomy, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        slug = as_text(item.get("slug")).strip()
+        subcategory_slug = as_text(item.get("subcategory_slug")).strip()
+        name_key = as_text(item.get("name")).strip().lower()
+        if slug and subcategory_slug:
+            tag_subcategory_by_slug[slug] = subcategory_slug
+        if slug in tag_ids:
+            tag_subcategory_by_id[tag_ids[slug]] = subcategory_slug
+        if name_key and slug in tag_ids:
+            tag_ids_by_name.setdefault(name_key, []).append(tag_ids[slug])
+
+    log("[seed] Locations (from snapshot)...")
+    location_id_by_key: Dict[str, str] = {}
+    for item in snapshot.get("locations", []):
+        if not isinstance(item, dict):
+            continue
+        name = as_text(item.get("name")).strip()
+        address = as_text(item.get("address")).strip()
+        if not name:
+            continue
+        loc_id = get_or_create_location(
+            cur,
+            name=name,
+            address=address,
+            latitude=float(item.get("latitude") or 0.0),
+            longitude=float(item.get("longitude") or 0.0),
+            features=item.get("features") if isinstance(item.get("features"), dict) else {},
+            cover_image_url=as_text(item.get("cover_image_url")),
+            rating_avg=as_float(item.get("rating_avg")),
+            rating_count=as_int(item.get("rating_count"), default=0),
+        )
+        location_id_by_key[location_key(name, address)] = loc_id
+    log(f"[seed] Locations done (snapshot): {len(location_id_by_key)}.")
+
+    log("[seed] Events (from snapshot)...")
+    seeded_event_ids: List[str] = []
+    skipped_events = 0
+    for item in snapshot.get("events", []):
+        if not isinstance(item, dict):
+            continue
+
+        title = as_text(item.get("title")).strip()
+        if not title:
+            skipped_events += 1
+            continue
+
+        subcategory_slug = as_text(item.get("subcategory_slug")).strip()
+        subcategory_id = subcat_ids.get(subcategory_slug)
+        if not subcategory_id:
+            skipped_events += 1
+            continue
+
+        category_slug = as_text(item.get("category_slug")).strip()
+        category_id = cat_ids.get(category_slug)
+        if not category_id:
+            # fallback from subcategory mapping in DB
+            row = fetch_one(
+                cur,
+                "SELECT category_id::text FROM subcategories WHERE id = %s",
+                (subcategory_id,),
+            )
+            if not row:
+                skipped_events += 1
+                continue
+            category_id = row[0]
+
+        category_text = (
+            category_name_by_slug.get(category_slug)
+            or as_text(item.get("category_text")).strip()
+            or "Other"
+        )
+
+        try:
+            start_time = parse_iso_datetime(item.get("start_time"))
+            end_time = parse_iso_datetime(item.get("end_time"))
+        except Exception:
+            skipped_events += 1
+            continue
+
+        loc_key = location_key(
+            as_text(item.get("location_name")).strip(),
+            as_text(item.get("location_address")).strip(),
+        )
+        location_id = location_id_by_key.get(loc_key)
+        if not location_id:
+            skipped_events += 1
+            continue
+
+        ev_id = get_or_create_event(
+            cur,
+            location_id=location_id,
+            title=title,
+            category=category_text,
+            category_id=category_id,
+            subcategory_id=subcategory_id,
+            start_time=start_time,
+            end_time=end_time,
+            description=as_text(item.get("description")),
+            cover_image_url=as_text(item.get("cover_image_url")),
+            ticket_url=as_text(item.get("ticket_url")),
+            price=float(item.get("price") or 0.0),
+            rating_avg=as_float(item.get("rating_avg")),
+            rating_count=as_int(item.get("rating_count"), default=0),
+        )
+        seeded_event_ids.append(ev_id)
+
+        chosen_tag_ids: List[str] = []
+        for tag_slug in item.get("tag_slugs", []):
+            slug = as_text(tag_slug).strip()
+            if not slug:
+                continue
+            if tag_subcategory_by_slug.get(slug) != subcategory_slug:
+                continue
+            tag_id = tag_ids.get(slug)
+            if tag_id:
+                chosen_tag_ids.append(tag_id)
+
+        if not chosen_tag_ids:
+            for tag_name in item.get("tag_names", []):
+                name_key = as_text(tag_name).strip().lower()
+                if not name_key:
+                    continue
+                candidates = tag_ids_by_name.get(name_key, [])
+                scoped = [candidate for candidate in candidates if tag_subcategory_by_id.get(candidate) == subcategory_slug]
+                if len(scoped) == 1:
+                    chosen_tag_ids.append(scoped[0])
+
+        replace_event_tags(cur, event_id=ev_id, tag_ids=chosen_tag_ids)
+
+        if no_optional:
+            continue
+
+        artist_ids: List[str] = []
+        for artist in item.get("artists", []):
+            if not isinstance(artist, dict):
+                continue
+            artist_name = as_text(artist.get("name")).strip()
+            if not artist_name:
+                continue
+            artist_ids.append(
+                get_or_create_artist(
+                    cur,
+                    name=artist_name,
+                    bio=as_text(artist.get("bio")),
+                    image_url=as_text(artist.get("image_url")),
+                    social_links=artist.get("social_links") if isinstance(artist.get("social_links"), dict) else {},
+                )
+            )
+        replace_event_artists(cur, event_id=ev_id, artist_ids=artist_ids)
+        replace_event_photos(cur, event_id=ev_id, photo_urls=item.get("photos", []))
+
+    log(f"[seed] Events done (snapshot): {len(seeded_event_ids)} (skipped {skipped_events}).")
+    return seeded_event_ids
 
 
 # -----------------------------
@@ -1203,6 +1748,16 @@ def main() -> int:
         action="store_true",
         help="Seed only taxonomy tables (categories/subcategories/tags), then exit.",
     )
+    parser.add_argument(
+        "--snapshot",
+        type=Path,
+        help="Seed taxonomy + locations + events from a snapshot JSON exported earlier.",
+    )
+    parser.add_argument(
+        "--export-snapshot",
+        type=Path,
+        help="Export current DB taxonomy + locations + events (+links) to snapshot JSON and exit.",
+    )
     parser.add_argument("--no-optional", action="store_true", help="Skip optional artists/photos.")
     args = parser.parse_args()
 
@@ -1210,6 +1765,14 @@ def main() -> int:
         parser.error("--hard can only be used together with --reset.")
     if args.hard and args.tags:
         parser.error("--hard cannot be used together with --tags.")
+    if args.hard and args.snapshot:
+        parser.error("--hard cannot be used together with --snapshot.")
+    if args.export_snapshot:
+        if any([args.reset, args.reset_content, args.hard, args.tags, args.snapshot, args.no_optional]):
+            parser.error(
+                "--export-snapshot cannot be combined with reset/seed flags. "
+                "Use it alone to dump current DB state."
+            )
 
     try:
         conn = connect()
@@ -1220,6 +1783,11 @@ def main() -> int:
     try:
         with conn:
             with conn.cursor() as cur:
+                if args.export_snapshot:
+                    export_snapshot(cur, out_path=args.export_snapshot)
+                    log("[done] Snapshot export complete.")
+                    return 0
+
                 if args.reset:
                     reset_all(cur)
                     if args.hard:
@@ -1228,23 +1796,31 @@ def main() -> int:
                 elif args.reset_content:
                     reset_content_keep_taxonomy(cur)
 
-                cat_ids, subcat_ids, tag_ids = seed_taxonomy(cur)
-                if args.tags:
-                    log("[done] Taxonomy seed complete (categories/subcategories/tags only).")
-                    return 0
+                if args.snapshot:
+                    snapshot_payload = load_snapshot(args.snapshot)
+                    if args.tags:
+                        seed_taxonomy_from_snapshot(cur, snapshot_payload)
+                        log("[done] Taxonomy seed complete from snapshot (categories/subcategories/tags only).")
+                        return 0
+                    seed_from_snapshot(cur, snapshot=snapshot_payload, no_optional=args.no_optional)
+                else:
+                    cat_ids, subcat_ids, tag_ids = seed_taxonomy(cur)
+                    if args.tags:
+                        log("[done] Taxonomy seed complete (categories/subcategories/tags only).")
+                        return 0
 
-                locations = seed_locations(cur)
-                event_ids = seed_events_and_links(
-                    cur,
-                    locations=locations,
-                    cat_ids=cat_ids,
-                    subcat_ids=subcat_ids,
-                    tag_ids=tag_ids,
-                )
+                    locations = seed_locations(cur)
+                    event_ids = seed_events_and_links(
+                        cur,
+                        locations=locations,
+                        cat_ids=cat_ids,
+                        subcat_ids=subcat_ids,
+                        tag_ids=tag_ids,
+                    )
 
-                if not args.no_optional:
-                    seed_artists_and_links(cur, event_ids)
-                    seed_event_photos(cur, event_ids)
+                    if not args.no_optional:
+                        seed_artists_and_links(cur, event_ids)
+                        seed_event_photos(cur, event_ids)
 
         log("[done] Commit successful.")
         return 0
